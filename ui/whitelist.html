@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Белый список — KitoFtorVPN</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --border: rgba(255,255,255,0.06);
+      --accent: #10b981;
+      --accent-hover: #34d399;
+      --text: #f1f5f9;
+      --text-dim: #94a3b8;
+      --text-muted: #475569;
+      --danger: #f43f5e;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .titlebar {
+      display: flex; justify-content: space-between; align-items: center;
+      height: 38px; padding: 0 12px;
+      background: rgba(0,0,0,0.2);
+      border-bottom: 1px solid var(--border);
+      -webkit-app-region: drag; flex-shrink: 0;
+    }
+    .titlebar-title { font-size: 12px; font-weight: 600; color: var(--text-dim); }
+    .titlebar-btns { -webkit-app-region: no-drag; }
+    .titlebar-btns button {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; width: 30px; height: 26px; border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      transition: all 0.15s;
+    }
+    .titlebar-btns button:hover { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+
+    .content {
+      flex: 1; padding: 18px 22px; display: flex; flex-direction: column;
+      min-height: 0;
+    }
+
+    .header {
+      margin-bottom: 12px;
+    }
+    .title {
+      font-size: 16px; font-weight: 700; margin-bottom: 6px;
+    }
+    .desc {
+      font-size: 12px; color: var(--text-dim); line-height: 1.5;
+    }
+
+    .editor {
+      flex: 1; display: flex; flex-direction: column; min-height: 0;
+      margin-bottom: 14px;
+    }
+
+    textarea {
+      flex: 1;
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      color: var(--text);
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-size: 13px;
+      line-height: 1.5;
+      resize: none;
+      outline: none;
+      user-select: text;
+    }
+    textarea:focus {
+      border-color: rgba(16,185,129,0.4);
+    }
+    textarea::placeholder {
+      color: var(--text-muted);
+    }
+
+    .hint {
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+
+    .footer {
+      display: flex; gap: 8px; justify-content: flex-end;
+      flex-shrink: 0;
+    }
+    .btn {
+      height: 36px; padding: 0 18px;
+      border: none; border-radius: 8px;
+      font-family: inherit; font-size: 13px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s;
+    }
+    .btn-cancel {
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+    }
+    .btn-cancel:hover { background: rgba(255,255,255,0.07); color: var(--text); }
+    .btn-save {
+      background: var(--accent); color: var(--bg);
+    }
+    .btn-save:hover { background: var(--accent-hover); }
+    .btn-save:disabled { opacity: 0.5; cursor: not-allowed; }
+  </style>
+</head>
+<body>
+  <div class="titlebar">
+    <span class="titlebar-title">Белый список</span>
+    <div class="titlebar-btns">
+      <button onclick="api.closeWhitelist()" title="Закрыть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="content">
+    <div class="header">
+      <div class="title">Сайты в обход VPN</div>
+      <div class="desc">
+        При посещении этих сайтов трафик пойдёт напрямую, без VPN.
+        Удобно для банков, госуслуг и сервисов, блокирующих VPN.
+      </div>
+    </div>
+
+    <div class="editor">
+      <textarea
+        id="list"
+        placeholder="example.com&#10;ya.ru&#10;sberbank.ru&#10;192.168.1.1&#10;10.0.0.0/24"
+        spellcheck="false"
+      ></textarea>
+      <div class="hint">
+        По одной записи на строку. Можно домены (example.com), IP (1.2.3.4) или подсети (10.0.0.0/24).
+      </div>
+    </div>
+
+    <div class="footer">
+      <button class="btn btn-cancel" onclick="api.closeWhitelist()">Отмена</button>
+      <button class="btn btn-save" id="saveBtn" onclick="save()">Сохранить</button>
+    </div>
+  </div>
+
+  <script>
+    async function init() {
+      const list = await api.getWhitelist();
+      document.getElementById('list').value = (list || []).join('\n');
+      document.getElementById('list').focus();
+    }
+
+    async function save() {
+      const btn = document.getElementById('saveBtn');
+      btn.disabled = true;
+      const text = document.getElementById('list').value;
+      const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      try {
+        await api.saveWhitelist(lines);
+        api.closeWhitelist();
+      } catch(e) {
+        btn.disabled = false;
+      }
+    }
+
+    // Ctrl+Enter — save
+    document.addEventListener('keydown', (e) => {
+      if (e.ctrlKey && e.key === 'Enter') save();
+      if (e.key === 'Escape') api.closeWhitelist();
+    });
+
+    init();
+  </script>
+</body>
+</html>

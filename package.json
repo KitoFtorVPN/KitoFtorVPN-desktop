@@ -1,0 +1,80 @@
+{
+  "name": "kitoftorvpn",
+  "productName": "KitoFtorVPN",
+  "version": "1.0.0",
+  "description": "KitoFtorVPN Desktop Client",
+  "author": {
+    "name": "KitoFtorVPN",
+    "email": "noreply@kitoftorvpn.fun"
+  },
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "publish": "electron-builder --publish always"
+  },
+  "devDependencies": {
+    "electron": "^36.4.0",
+    "electron-builder": "^25.1.8"
+  },
+  "dependencies": {
+    "electron-updater": "^6.3.9"
+  },
+  "build": {
+    "appId": "fun.kitoftorvpn.desktop",
+    "productName": "KitoFtorVPN",
+    "copyright": "Copyright © 2026 KitoFtorVPN",
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "ui/**/*",
+      "!**/*.map",
+      "!**/.DS_Store"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin",
+        "filter": ["**/*"]
+      },
+      {
+        "from": "build",
+        "to": "build",
+        "filter": ["*.ico"]
+      }
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator",
+      "artifactName": "KitoFtorVPN-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "KitoFtorVPN",
+      "installerIcon": "build/installer-icon.ico",
+      "uninstallerIcon": "build/installer-icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "deleteAppDataOnUninstall": false
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "KitoFtorVPN",
+        "repo": "KitoFtorVPN-desktop",
+        "releaseType": "release"
+      }
+    ]
+  }
+}
