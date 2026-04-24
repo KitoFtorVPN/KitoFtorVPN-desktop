@@ -7,6 +7,7 @@ contextBridge.exposeInMainWorld('api', {
   google: () => ipcRenderer.invoke('auth:google'),
   telegram: () => ipcRenderer.invoke('auth:telegram'),
   logout: () => ipcRenderer.invoke('auth:logout'),
+  sessionExpired: () => ipcRenderer.invoke('auth:sessionExpired'),
   guestLogin: () => ipcRenderer.invoke('auth:guestLogin'),
   exitGuest: () => ipcRenderer.invoke('auth:exitGuest'),
   isGuest: () => ipcRenderer.invoke('auth:isGuest'),
@@ -44,10 +45,9 @@ contextBridge.exposeInMainWorld('api', {
 
   // External links
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
-  getVersion: () => ipcRenderer.invoke('app:getVersion'),
-
   // App info
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
+  notifySubExpiring: (days) => ipcRenderer.invoke('notify:subExpiring', days),
 
   // VPN events (main → renderer)
   onReconnecting: (cb) => {
@@ -59,5 +59,15 @@ contextBridge.exposeInMainWorld('api', {
     const listener = (_e, p) => cb(p);
     ipcRenderer.on('vpn:reconnected', listener);
     return () => ipcRenderer.removeListener('vpn:reconnected', listener);
+  },
+  onAutoConnecting: (cb) => {
+    const listener = (_e, p) => cb(p);
+    ipcRenderer.on('vpn:autoconnecting', listener);
+    return () => ipcRenderer.removeListener('vpn:autoconnecting', listener);
+  },
+  onAutoConnected: (cb) => {
+    const listener = (_e, p) => cb(p);
+    ipcRenderer.on('vpn:autoconnected', listener);
+    return () => ipcRenderer.removeListener('vpn:autoconnected', listener);
   },
 });
