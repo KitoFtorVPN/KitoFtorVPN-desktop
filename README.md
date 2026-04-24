@@ -32,7 +32,7 @@ Windows-клиент KitoFtorVPN на базе AmneziaWG 2.0.
 
 ## Сборка из исходников
 
-Требуется Node.js 18+ и Go 1.21+.
+Требуется Node.js 24+ и Go 1.21+.
 
 ```bash
 # Установка зависимостей
@@ -66,7 +66,7 @@ KitoFtorVPN/
 ├── bin/              — Go-хелпер и TUN-драйвер
 │   ├── kitoftor-tunnel.exe
 │   └── wintun.dll
-└── build/            — иконки приложения и трея
+└── build/            — иконки приложения, трея и NSIS-скрипт
 ```
 
 ## Сайт
