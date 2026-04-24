@@ -1,7 +1,7 @@
 {
   "name": "kitoftorvpn",
   "productName": "KitoFtorVPN",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "KitoFtorVPN Desktop Client",
   "author": {
     "name": "KitoFtorVPN",
@@ -40,17 +40,26 @@
       {
         "from": "bin",
         "to": "bin",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "build",
         "to": "build",
-        "filter": ["*.ico"]
+        "filter": [
+          "*.ico"
+        ]
       }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "build/icon.ico",
       "requestedExecutionLevel": "requireAdministrator",
@@ -66,7 +75,8 @@
       "installerIcon": "build/installer-icon.ico",
       "uninstallerIcon": "build/installer-icon.ico",
       "installerHeaderIcon": "build/icon.ico",
-      "deleteAppDataOnUninstall": false
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh"
     },
     "publish": [
       {

@@ -53,7 +53,7 @@
 
     /* ── Content ── */
     .content {
-      flex: 1; display: flex; flex-direction: column;
+      display: flex; flex-direction: column;
       align-items: center; padding: 0 28px;
     }
 
@@ -154,7 +154,7 @@
     .vpn-status.connecting { color: var(--warning); }
     .vpn-status.on { color: var(--accent); }
 
-    .vpn-hint { font-size: 13px; color: var(--text-muted); }
+    .vpn-hint { font-size: 13px; color: var(--text-muted); height: 18px; }
 
     /* ── Import prompt ── */
     .import-prompt {
@@ -262,6 +262,19 @@
   <div class="content" id="app">
     <div class="loading">Загрузка...</div>
   </div>
+  <!-- Static VPN center — lives outside #app so render() never wipes it -->
+  <div class="vpn-center" id="vpnCenterWrap" style="display:none">
+    <button class="power-btn off" id="powerBtn" onclick="toggleVPN()">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="44" height="44">
+        <path d="M18.36 6.64a9 9 0 11-12.73 0"/>
+        <line x1="12" y1="2" x2="12" y2="12"/>
+      </svg>
+    </button>
+    <div class="vpn-status off" id="vpnStatusText">Не подключено</div>
+    <div class="vpn-hint" id="vpnHint">Нажмите для подключения</div>
+    <div id="sessionTimer" style="font-size:16px;font-weight:600;color:var(--accent);margin-top:2px;height:20px;visibility:hidden"></div>
+    <div class="error-msg" id="error" style="display:none"></div>
+  </div>
 
   <script>
     const SITE_URL = 'https://my.kitoftorvpn.fun';
@@ -271,10 +284,7 @@
     let menuOpen = false;
     let connectReason = null; // 'whitelist' during whitelist-triggered restart
 
-    const powerIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M18.36 6.64a9 9 0 11-12.73 0"/>
-      <line x1="12" y1="2" x2="12" y2="12"/>
-    </svg>`;
+
 
     // Listen for VPN events from main process.
     if (api.onReconnecting) {
@@ -292,6 +302,23 @@
         startSessionTimer();
       });
     }
+    // Autoconnect events — show connecting state immediately on startup.
+    if (api.onAutoConnecting) {
+      api.onAutoConnecting((p) => {
+        connectReason = p && p.reason ? p.reason : null;
+        vpnState = 'connecting';
+        render();
+      });
+    }
+    if (api.onAutoConnected) {
+      api.onAutoConnected((p) => {
+        connectReason = null;
+        vpnState = p && p.ok ? 'on' : 'off';
+        render();
+        startSessionTimer();
+        if (p && p.error) showError(p.error);
+      });
+    }
 
     let isGuestMode = false;
 
@@ -307,10 +334,18 @@
       } else {
         const sub = await api.fetch('/api/sub');
         if (sub.error === 'unauthorized' || sub.redirect) {
-          await api.logout();
+          // Session expired on server — go back to login but keep the token
+          // on disk so the user isn't forced to re-enter credentials if the
+          // server was just temporarily unavailable.
+          await api.sessionExpired();
           return;
         }
         subData = sub;
+        // Notify if subscription expires within 3 days
+        if (sub.expires_in !== undefined && sub.expires_in !== null && sub.expires_in <= 259200) {
+          const daysLeft = Math.ceil(sub.expires_in / 86400);
+          api.notifySubExpiring(daysLeft);
+        }
       }
 
       hasConf = await api.configExists();
@@ -351,7 +386,12 @@
 
     async function startSessionTimer() {
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
-      if (vpnState !== 'on') { cachedConnectTime = null; return; }
+      if (vpnState !== 'on') {
+        cachedConnectTime = null;
+        const el = document.getElementById('sessionTimer');
+        if (el) { el.style.visibility = 'hidden'; el.textContent = ''; }
+        return;
+      }
 
       // Fetch connect time once — then tick locally. Avoids IPC on every
       // second, which was causing the timer to briefly vanish.
@@ -362,11 +402,16 @@
         const el = document.getElementById('sessionTimer');
         if (!el || !cachedConnectTime) return;
         el.textContent = formatTimer();
-        el.style.display = '';
+        el.style.visibility = 'visible';
       };
       tick(); // show immediately, don't wait 1s
       timerInterval = setInterval(() => {
-        if (vpnState !== 'on') { clearInterval(timerInterval); timerInterval = null; return; }
+        if (vpnState !== 'on') {
+          clearInterval(timerInterval); timerInterval = null;
+          const el = document.getElementById('sessionTimer');
+          if (el) { el.style.visibility = 'hidden'; el.textContent = ''; }
+          return;
+        }
         tick();
       }, 1000);
     }
@@ -381,12 +426,82 @@
       }
     }
 
-    function render() {
-      const app = document.getElementById('app');
-      if (!subData) {
-        app.innerHTML = '<div class="loading">Загрузка...</div>';
+    const powerIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="44" height="44"><path d="M18.36 6.64a9 9 0 11-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>`;
+
+    function updateVpnCenter(s, canConnect) {
+      const wrap = document.getElementById('vpnCenterWrap');
+      const btn = document.getElementById('powerBtn');
+      const statusEl = document.getElementById('vpnStatusText');
+      const hintEl = document.getElementById('vpnHint');
+      if (!wrap || !btn || !statusEl || !hintEl) return;
+
+      // Remove any old dynamic content (import-prompt, btn-renew) injected previously
+      ['importPrompt','btnRenew'].forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
+
+      wrap.style.display = 'flex';
+
+      if (!hasConf) {
+        btn.style.display = 'none';
+        statusEl.style.display = 'none';
+        hintEl.style.display = 'none';
+        if (!document.getElementById('importPrompt')) {
+          const div = document.createElement('div');
+          div.id = 'importPrompt';
+          div.className = 'import-prompt';
+          div.innerHTML = `<p>Для подключения загрузите<br>файл конфигурации (.conf)<br>из личного кабинета или бота</p>
+            <button class="import-link" onclick="doImport()">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Загрузить конфигурацию
+            </button>`;
+          wrap.insertBefore(div, wrap.firstChild);
+        }
         return;
       }
+
+      if (!canConnect) {
+        btn.className = 'power-btn off';
+        btn.disabled = true;
+        btn.style.display = '';
+        statusEl.style.display = '';
+        statusEl.className = 'vpn-status off';
+        statusEl.textContent = 'Не подключено';
+        hintEl.style.display = 'none';
+        if (!document.getElementById('btnRenew')) {
+          const btnLabel = s.status === 'none' ? 'Оформить подписку' : 'Продлить подписку';
+          const b = document.createElement('button');
+          b.id = 'btnRenew';
+          b.className = 'btn-renew';
+          b.onclick = () => api.openExternal(SITE_URL + '/login?desktop=1');
+          b.textContent = btnLabel;
+          wrap.appendChild(b);
+        }
+        return;
+      }
+
+      // Normal connected/connecting/off state
+      btn.style.display = '';
+      btn.disabled = vpnState === 'connecting';
+      btn.className = 'power-btn ' + vpnState;
+      statusEl.style.display = '';
+      statusEl.className = 'vpn-status ' + vpnState;
+      statusEl.textContent = vpnState === 'on' ? 'Подключено'
+        : vpnState === 'connecting' ? (connectReason === 'disconnecting' ? 'Отключение...' : connectReason === 'whitelist' ? 'Применение...' : 'Подключение...')
+        : 'Не подключено';
+      hintEl.style.display = '';
+      hintEl.textContent = vpnState === 'connecting'
+        ? (connectReason === 'disconnecting' ? 'Завершаем соединение' : connectReason === 'whitelist' ? 'Обновляем белый список' : 'Устанавливаем соединение')
+        : vpnState === 'off' ? 'Нажмите для подключения' : '';
+    }
+
+    function render() {
+      const app = document.getElementById('app');
+      const wrap = document.getElementById('vpnCenterWrap');
+      if (!subData) {
+        app.innerHTML = '<div class="loading">Загрузка...</div>';
+        if (wrap) wrap.style.display = 'none';
+        return;
+      }
+      if (wrap) wrap.style.display = 'flex';
 
       document.body.className = vpnState === 'on' ? 'state-on' : vpnState === 'connecting' ? 'state-connecting' : '';
 
@@ -446,65 +561,12 @@
         }
       }
 
-      // VPN center content
-      let vpnHTML = '';
-
-      if (!hasConf) {
-        vpnHTML = `
-          <div class="import-prompt">
-            <p>Для подключения загрузите<br>файл конфигурации (.conf)<br>из личного кабинета или бота</p>
-            <button class="import-link" onclick="doImport()">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-                <polyline points="17 8 12 3 7 8"/>
-                <line x1="12" y1="3" x2="12" y2="15"/>
-              </svg>
-              Загрузить конфигурацию
-            </button>
-          </div>`;
-      } else if (!canConnect) {
-        const btnLabel = s.status === 'none' ? 'Оформить подписку' : 'Продлить подписку';
-        vpnHTML = `
-          <button class="power-btn off" disabled>
-            ${powerIcon}
-          </button>
-          <div class="vpn-status off">Не подключено</div>
-          <button class="btn-renew" onclick="api.openExternal('${SITE_URL}/login?desktop=1')">${btnLabel}</button>`;
-      } else {
-        const statusTxt = vpnState === 'on' ? 'Подключено' : vpnState === 'connecting' ? (connectReason === 'whitelist' ? 'Применение...' : 'Подключение...') : 'Не подключено';
-        const hintTxt = vpnState === 'connecting' ? (connectReason === 'whitelist' ? 'Обновляем белый список' : 'Устанавливаем соединение') : vpnState === 'off' ? 'Нажмите для подключения' : '';
-        const btnDisabled = vpnState === 'connecting' ? 'disabled' : '';
-
-        vpnHTML = `
-          <button class="power-btn ${vpnState}" onclick="toggleVPN()" ${btnDisabled}>
-            ${powerIcon}
-          </button>
-          <div class="vpn-status ${vpnState}">${statusTxt}</div>
-          <div class="vpn-hint" id="vpnHint">${hintTxt}</div>
-          <div id="sessionTimer" style="font-size:16px;font-weight:600;color:var(--accent);margin-top:2px;height:20px;${vpnState === 'on' ? '' : 'display:none'}">${vpnState === 'on' ? formatTimer() : ''}</div>
-          <div class="error-msg" id="error" style="display:none"></div>`;
-      }
+      // VPN center — update static DOM elements, never recreate them (prevents jumping).
+      updateVpnCenter(s, canConnect);
 
       // Menu items
       let menuItems = '';
-      if (hasConf) {
-        menuItems += `
-          <button class="menu-item" onclick="doChangeConfig()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
-              <polyline points="17 8 12 3 7 8"/>
-              <line x1="12" y1="3" x2="12" y2="15"/>
-            </svg>
-            Сменить конфигурацию
-          </button>
-          <button class="menu-item danger" onclick="doDeleteConfig()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
-            </svg>
-            Удалить конфигурацию
-          </button>`;
-      }
+
       menuItems += `
         <button class="menu-item" onclick="doOpenSettings()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -554,9 +616,7 @@
 
         ${cardHTML}
 
-        <div class="vpn-center">
-          ${vpnHTML}
-        </div>
+
       `;
     }
 
@@ -564,9 +624,9 @@
       if (vpnState === 'connecting') return;
 
       if (vpnState === 'on') {
-        vpnState = 'connecting'; render();
+        connectReason = 'disconnecting'; vpnState = 'connecting'; render();
         const res = await api.disconnect();
-        vpnState = res.ok ? 'off' : 'on';
+        connectReason = null; vpnState = res.ok ? 'off' : 'on';
         render();
         startSessionTimer();
         if (res.error) showError(res.error);
@@ -610,30 +670,6 @@
         render();
         showToast();
       }
-    }
-
-    async function doChangeConfig() {
-      menuOpen = false;
-      const res = await api.importConfig();
-      if (res.canceled) return;
-      if (res.error) { render(); showError(res.error); return; }
-      if (res.ok) {
-        if (vpnState === 'on') {
-          await api.disconnect();
-          vpnState = 'off';
-        }
-        hasConf = true;
-        render();
-        showToast();
-      }
-    }
-
-    async function doDeleteConfig() {
-      menuOpen = false;
-      await api.deleteConfig();
-      hasConf = false;
-      vpnState = 'off';
-      render();
     }
 
     async function doLogout() {

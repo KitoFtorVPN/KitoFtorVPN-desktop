@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage, screen, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -20,8 +20,17 @@ const TOKEN_FILE = path.join(DATA_DIR, 'session.dat');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.dat');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const CONNECT_TIME_FILE = path.join(DATA_DIR, 'connect_time.dat');
-const REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
-const REG_NAME = 'KitoFtorVPN';
+const TASK_NAME = 'KitoFtorVPNAutostart';
+
+function showNotification(title, body, onlyWhenHidden = false) {
+  if (!Notification.isSupported()) return;
+  if (onlyWhenHidden && mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return;
+  const icon = (typeof APP_ICON !== 'undefined') ? APP_ICON : undefined;
+  new Notification({ title, body, icon, silent: true }).show();
+}
+
+// Required for Windows toast notifications to work (both dev and packaged).
+app.setAppUserModelId('fun.kitoftorvpn.desktop');
 
 // Prevent multiple instances
 const gotLock = app.requestSingleInstanceLock();
@@ -279,9 +288,23 @@ function setAutostart(enabled) {
   const exePath = process.execPath;
   try {
     if (enabled) {
-      execFile('reg', ['add', REG_KEY, '/v', REG_NAME, '/t', 'REG_SZ', '/d', `"${exePath}" --hidden`, '/f']);
+      // Task Scheduler is required because the app runs as Administrator
+      // (requireAdministrator in package.json). Registry HKCU\Run cannot
+      // elevate UAC, so the app would silently fail to start on boot.
+      const { execFileSync } = require('child_process');
+      // Delete first to avoid "already exists" error.
+      try { execFileSync('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { stdio: 'pipe' }); } catch(e) {}
+      execFileSync('schtasks', [
+        '/Create',
+        '/TN', TASK_NAME,
+        '/TR', `"${exePath}"`,
+        '/SC', 'ONLOGON',
+        '/RL', 'HIGHEST',
+        '/F',
+      ], { stdio: 'pipe' });
     } else {
-      execFile('reg', ['delete', REG_KEY, '/v', REG_NAME, '/f']);
+      const { execFileSync } = require('child_process');
+      try { execFileSync('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { stdio: 'pipe' }); } catch(e) {}
     }
   } catch(e) {
     console.error('setAutostart error:', e);
@@ -291,7 +314,7 @@ function setAutostart(enabled) {
 function getAutostartEnabled() {
   try {
     const { execFileSync } = require('child_process');
-    execFileSync('reg', ['query', REG_KEY, '/v', REG_NAME]);
+    execFileSync('schtasks', ['/Query', '/TN', TASK_NAME], { stdio: 'pipe' });
     return true;
   } catch(e) {
     return false;
@@ -437,8 +460,16 @@ function updateTrayMenu() {
       enabled: !isConnecting && hasConfig(),
       click: async () => {
         if (isOn) {
+          updateTrayIcon('connecting');
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnecting', { reason: 'disconnecting' });
           try { await tunnelExec('stop'); } catch(e) {}
+          deleteConnectTime();
+          updateTrayIcon('off');
+          showNotification('KitoFtorVPN', 'VPN отключён', true);
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: false });
         } else {
+          updateTrayIcon('connecting');
+          if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnecting');
           try {
             let conf = await loadConfig();
             if (conf) {
@@ -447,8 +478,15 @@ function updateTrayMenu() {
                 try { conf = await applyWhitelistToConfig(conf, s.whitelist); } catch(e) {}
               }
               await tunnelStartStdin(conf);
+              saveConnectTime();
+              updateTrayIcon('on');
+              showNotification('KitoFtorVPN', 'VPN подключён', true);
+              if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: true });
             }
-          } catch(e) {}
+          } catch(e) {
+            updateTrayIcon('off');
+            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: e.message });
+          }
         }
       }
     },
@@ -542,6 +580,9 @@ async function createWindow() {
   mainWindow.on('close', (e) => {
     if (!isQuitting) {
       e.preventDefault();
+      // Close child windows before hiding to tray.
+      if (whitelistWindow && !whitelistWindow.isDestroyed()) { whitelistWindow.destroy(); whitelistWindow = null; }
+      if (settingsWindow && !settingsWindow.isDestroyed()) { settingsWindow.destroy(); settingsWindow = null; }
       mainWindow.hide();
     }
   });
@@ -563,6 +604,14 @@ async function createWindow() {
 
   // Auto-connect if setting enabled
   if (settings.autoconnect && cachedToken && hasConfig()) {
+    // Notify renderer as soon as the window is ready so it shows "Подключение..."
+    // immediately — before the tunnel actually starts.
+    mainWindow.webContents.once('did-finish-load', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('vpn:autoconnecting');
+      }
+    });
+
     setTimeout(async () => {
       try {
         let conf = await loadConfig();
@@ -571,13 +620,23 @@ async function createWindow() {
             try { conf = await applyWhitelistToConfig(conf, settings.whitelist); } catch(e) {}
           }
           updateTrayIcon('connecting');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vpn:autoconnecting');
+          }
           await tunnelStartStdin(conf);
           saveConnectTime();
           updateTrayIcon('on');
+          showNotification('KitoFtorVPN', 'VPN подключён', true);
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vpn:autoconnected', { ok: true });
+          }
         }
       } catch(e) {
         console.error('autoconnect error:', e);
         updateTrayIcon('off');
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: e.message });
+        }
       }
     }, 2000);
   }
@@ -646,25 +705,27 @@ function openSettings() {
     return;
   }
 
-  // Position to the left of main window with 12px gap
-  const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200 };
+  // Position to the left of main window with 12px gap, clamped to work area.
+  const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200, width: 380, height: 560 };
   const settingsWidth = 340;
-  const settingsHeight = 470;
+  const settingsHeight = 600;
   const gap = 12;
-  const x = mainBounds.x - settingsWidth - gap;
-  const y = mainBounds.y + Math.round((mainBounds.height - settingsHeight) / 2);
+  const display = screen.getDisplayNearestPoint({ x: mainBounds.x, y: mainBounds.y });
+  const wa = display.workArea;
+  let sx = mainBounds.x - settingsWidth - gap;
+  let sy = mainBounds.y + Math.round((mainBounds.height - settingsHeight) / 2);
+  sx = Math.min(Math.max(sx, wa.x), wa.x + wa.width - settingsWidth);
+  sy = Math.min(Math.max(sy, wa.y), wa.y + wa.height - settingsHeight);
 
   settingsWindow = new BrowserWindow({
     width: settingsWidth,
     height: settingsHeight,
-    x: Math.max(0, x),
-    y: Math.max(0, y),
+    x: sx,
+    y: sy,
     resizable: false,
     frame: false,
     transparent: false,
     backgroundColor: '#0b1120',
-    parent: mainWindow,
-    modal: false,
     icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -674,7 +735,13 @@ function openSettings() {
   });
 
   settingsWindow.loadFile('ui/settings.html');
-  settingsWindow.on('closed', () => { settingsWindow = null; });
+  settingsWindow.on('closed', () => {
+    settingsWindow = null;
+    // Return focus to main window without changing its z-order.
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+      mainWindow.focus();
+    }
+  });
 }
 
 function openWhitelist() {
@@ -684,25 +751,27 @@ function openWhitelist() {
   }
 
   // Position to the right of main window, mirroring settings (which sits
-  // on the left with a 12px gap).
+  // on the left with a 12px gap). Clamped to work area so it never goes off-screen.
   const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200, width: 380, height: 560 };
   const w = 460;
   const h = 540;
   const gap = 12;
-  const x = mainBounds.x + mainBounds.width + gap;
-  const y = mainBounds.y + Math.round((mainBounds.height - h) / 2);
+  const display = screen.getDisplayNearestPoint({ x: mainBounds.x, y: mainBounds.y });
+  const wa = display.workArea;
+  let wx = mainBounds.x + mainBounds.width + gap;
+  let wy = mainBounds.y + Math.round((mainBounds.height - h) / 2);
+  wx = Math.min(Math.max(wx, wa.x), wa.x + wa.width - w);
+  wy = Math.min(Math.max(wy, wa.y), wa.y + wa.height - h);
 
   whitelistWindow = new BrowserWindow({
     width: w,
     height: h,
-    x: Math.max(0, x),
-    y: Math.max(0, y),
+    x: wx,
+    y: wy,
     resizable: false,
     frame: false,
     transparent: false,
     backgroundColor: '#0b1120',
-    parent: mainWindow,
-    modal: false,
     icon: APP_ICON,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -712,7 +781,14 @@ function openWhitelist() {
   });
 
   whitelistWindow.loadFile('ui/whitelist.html');
-  whitelistWindow.on('closed', () => { whitelistWindow = null; });
+  whitelistWindow.on('closed', () => {
+    whitelistWindow = null;
+    // Return focus to settings if open, otherwise to main — without sinking either window.
+    const target = (settingsWindow && !settingsWindow.isDestroyed() && settingsWindow.isVisible())
+      ? settingsWindow
+      : (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : null);
+    if (target) target.focus();
+  });
 }
 
 // ─── Auth: browser + local callback ─────────────────────
@@ -803,6 +879,21 @@ ipcMain.handle('auth:logout', async () => {
   cachedToken = null;
   isGuest = false;
   deleteToken();
+  try { await tunnelExec('stop'); } catch(e) {}
+  updateTrayIcon('off');
+  if (mainWindow) {
+    resizeWindowFor('login');
+    mainWindow.loadFile('ui/login.html');
+  }
+  return { ok: true };
+});
+
+// Session expired — show login screen WITHOUT deleting the saved token.
+// The token stays on disk so if the server was temporarily unavailable,
+// the next launch won't force a full re-login.
+ipcMain.handle('auth:sessionExpired', async () => {
+  cachedToken = null;
+  isGuest = false;
   try { await tunnelExec('stop'); } catch(e) {}
   updateTrayIcon('off');
   if (mainWindow) {
@@ -1085,21 +1176,47 @@ ipcMain.handle('vpn:status', async () => {
     const result = await tunnelExec('status');
     const state = result === 'RUNNING' ? 'on' : 'off';
     if (state === 'off') deleteConnectTime();
-    if (state !== vpnStateForTray) updateTrayIcon(state);
+    if (state !== vpnStateForTray) {
+      // Unexpected drop — was running, now stopped
+      if (vpnStateForTray === 'on' && state === 'off') {
+        showNotification('KitoFtorVPN', 'VPN отключён', true);
+      }
+      updateTrayIcon(state);
+    }
     return { status: result };
   } catch(e) {
     deleteConnectTime();
-    if (vpnStateForTray !== 'off') updateTrayIcon('off');
+    if (vpnStateForTray !== 'off') {
+      showNotification('KitoFtorVPN', 'VPN отключён', true);
+      updateTrayIcon('off');
+    }
     return { status: 'STOPPED' };
   }
 });
 
 ipcMain.handle('vpn:getConnectTime', () => loadConnectTime());
 
+// ─── IPC: Subscription expiry notification ───────────────
+
+let subExpiryNotifShown = false; // show once per app session
+
+ipcMain.handle('notify:subExpiring', (event, daysLeft) => {
+  if (subExpiryNotifShown) return;
+  subExpiryNotifShown = true;
+  const msg = daysLeft <= 0 ? 'Подписка истекает сегодня'
+    : daysLeft === 1 ? 'Подписка заканчивается завтра'
+    : `Подписка заканчивается через ${daysLeft} дн.`;
+  showNotification('KitoFtorVPN', msg);
+});
+
 // ─── IPC: Window controls ────────────────────────────────
 
 ipcMain.handle('window:minimize', () => { if (mainWindow) mainWindow.minimize(); });
-ipcMain.handle('window:close', () => { if (mainWindow) mainWindow.hide(); });
+ipcMain.handle('window:close', () => {
+  if (whitelistWindow && !whitelistWindow.isDestroyed()) { whitelistWindow.destroy(); whitelistWindow = null; }
+  if (settingsWindow && !settingsWindow.isDestroyed()) { settingsWindow.destroy(); settingsWindow = null; }
+  if (mainWindow) mainWindow.hide();
+});
 
 // ─── IPC: External links ─────────────────────────────────
 
