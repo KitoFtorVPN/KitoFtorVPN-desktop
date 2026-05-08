@@ -378,10 +378,26 @@
       if (!cachedConnectTime) return '';
       const diff = Math.floor((Date.now() - cachedConnectTime) / 1000);
       if (diff < 0) return '';
-      const h = String(Math.floor(diff / 3600)).padStart(2, '0');
-      const m = String(Math.floor((diff % 3600) / 60)).padStart(2, '0');
-      const s = String(diff % 60).padStart(2, '0');
-      return `${h}:${m}:${s}`;
+      const totalSeconds = diff;
+      const days = Math.floor(totalSeconds / 86400);
+      const h = String(Math.floor((totalSeconds % 86400) / 3600)).padStart(2, '0');
+      const m = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, '0');
+      const s = String(totalSeconds % 60).padStart(2, '0');
+      const time = `${h}:${m}:${s}`;
+      if (days === 0) return time;
+      const mod10 = days % 10;
+      const mod100 = days % 100;
+      let dayWord;
+      if (mod100 >= 11 && mod100 <= 14) {
+        dayWord = 'дней';
+      } else if (mod10 === 1) {
+        dayWord = 'день';
+      } else if (mod10 >= 2 && mod10 <= 4) {
+        dayWord = 'дня';
+      } else {
+        dayWord = 'дней';
+      }
+      return `${days} ${dayWord} ${time}`;
     }
 
     async function startSessionTimer() {

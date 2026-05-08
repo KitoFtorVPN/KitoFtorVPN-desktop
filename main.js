@@ -11,6 +11,16 @@ const dns = require('dns').promises;
 let autoUpdater = null;
 try { autoUpdater = require('electron-updater').autoUpdater; } catch(e) {}
 
+// keytar — native OS credential store (Windows Credential Manager).
+// Eliminates the need to spawn tunnel.exe for DPAPI on every startup.
+// Falls back to legacy DPAPI-via-tunnel if not available.
+let keytar = null;
+try { keytar = require('keytar'); } catch(e) {}
+
+const KEYTAR_SERVICE = 'fun.kitoftorvpn.desktop';
+const KEYTAR_TOKEN_ACCOUNT = 'session_token';
+const KEYTAR_CONFIG_ACCOUNT = 'wireguard_config';
+
 const API_BASE = 'https://my.kitoftorvpn.fun';
 const TUNNEL_EXE = app.isPackaged
   ? path.join(process.resourcesPath, 'bin', 'kitoftor-tunnel.exe')
@@ -20,6 +30,7 @@ const TOKEN_FILE = path.join(DATA_DIR, 'session.dat');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.dat');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const CONNECT_TIME_FILE = path.join(DATA_DIR, 'connect_time.dat');
+const GUEST_FILE = path.join(DATA_DIR, 'guest_mode.dat');
 const TASK_NAME = 'KitoFtorVPNAutostart';
 
 function showNotification(title, body, onlyWhenHidden = false) {
@@ -311,14 +322,18 @@ function setAutostart(enabled) {
   }
 }
 
+let _autostartCache = null;
+
 function getAutostartEnabled() {
+  if (_autostartCache !== null) return _autostartCache;
   try {
     const { execFileSync } = require('child_process');
     execFileSync('schtasks', ['/Query', '/TN', TASK_NAME], { stdio: 'pipe' });
-    return true;
+    _autostartCache = true;
   } catch(e) {
-    return false;
+    _autostartCache = false;
   }
+  return _autostartCache;
 }
 
 // ─── DPAPI via Go helper ─────────────────────────────────
@@ -357,9 +372,15 @@ function dpapiDecrypt(base64data) {
 
 async function saveToken(token) {
   try {
-    const encrypted = await dpapiEncrypt(token);
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(TOKEN_FILE, encrypted, 'utf-8');
+    if (keytar) {
+      await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT, token);
+      // Remove legacy file if it exists
+      try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
+    } else {
+      const encrypted = await dpapiEncrypt(token);
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(TOKEN_FILE, encrypted, 'utf-8');
+    }
   } catch(e) {
     console.error('saveToken error:', e);
   }
@@ -367,10 +388,29 @@ async function saveToken(token) {
 
 async function loadToken() {
   try {
-    if (!fs.existsSync(TOKEN_FILE)) return null;
-    const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
-    if (!encrypted) return null;
-    return (await dpapiDecrypt(encrypted)) || null;
+    if (keytar) {
+      // Try keytar first
+      const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT);
+      if (val) return val;
+      // Migrate from legacy DPAPI file
+      if (fs.existsSync(TOKEN_FILE)) {
+        const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
+        if (encrypted) {
+          const plain = await dpapiDecrypt(encrypted);
+          if (plain) {
+            await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT, plain);
+            try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
+            return plain;
+          }
+        }
+      }
+      return null;
+    } else {
+      if (!fs.existsSync(TOKEN_FILE)) return null;
+      const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
+      if (!encrypted) return null;
+      return (await dpapiDecrypt(encrypted)) || null;
+    }
   } catch(e) {
     console.error('loadToken error:', e);
     return null;
@@ -378,6 +418,9 @@ async function loadToken() {
 }
 
 function deleteToken() {
+  if (keytar) {
+    keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT).catch(() => {});
+  }
   try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
 }
 
@@ -385,9 +428,14 @@ function deleteToken() {
 
 async function saveConfig(confText) {
   try {
-    const encrypted = await dpapiEncrypt(confText);
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(CONFIG_FILE, encrypted, 'utf-8');
+    if (keytar) {
+      await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT, confText);
+      try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
+    } else {
+      const encrypted = await dpapiEncrypt(confText);
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(CONFIG_FILE, encrypted, 'utf-8');
+    }
     return true;
   } catch(e) {
     console.error('saveConfig error:', e);
@@ -397,10 +445,28 @@ async function saveConfig(confText) {
 
 async function loadConfig() {
   try {
-    if (!fs.existsSync(CONFIG_FILE)) return null;
-    const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
-    if (!encrypted) return null;
-    return (await dpapiDecrypt(encrypted)) || null;
+    if (keytar) {
+      const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT);
+      if (val) return val;
+      // Migrate from legacy DPAPI file
+      if (fs.existsSync(CONFIG_FILE)) {
+        const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
+        if (encrypted) {
+          const plain = await dpapiDecrypt(encrypted);
+          if (plain) {
+            await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT, plain);
+            try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
+            return plain;
+          }
+        }
+      }
+      return null;
+    } else {
+      if (!fs.existsSync(CONFIG_FILE)) return null;
+      const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
+      if (!encrypted) return null;
+      return (await dpapiDecrypt(encrypted)) || null;
+    }
   } catch(e) {
     console.error('loadConfig error:', e);
     return null;
@@ -408,10 +474,22 @@ async function loadConfig() {
 }
 
 function hasConfig() {
+  if (keytar) {
+    // Can't check synchronously — caller must use loadConfig() !== null.
+    // For the sync check we fall back to file existence as a hint.
+    // The real check happens in config:exists IPC (made async below).
+    return fs.existsSync(CONFIG_FILE) || _keytarConfigCached;
+  }
   return fs.existsSync(CONFIG_FILE);
 }
 
+let _keytarConfigCached = false; // set after first successful loadConfig()
+
 function deleteConfigFile() {
+  if (keytar) {
+    keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT).catch(() => {});
+    _keytarConfigCached = false;
+  }
   try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
 }
 
@@ -557,7 +635,8 @@ async function createWindow() {
 
   // Pre-decide which page so we can size the window correctly from the start.
   cachedToken = await loadToken();
-  const startsOnMain = !!cachedToken;
+  isGuest = !cachedToken && loadGuestMode();
+  const startsOnMain = !!cachedToken || isGuest;
   const size = startsOnMain ? MAIN_SIZE : LOGIN_SIZE;
 
   mainWindow = new BrowserWindow({
@@ -603,7 +682,7 @@ async function createWindow() {
   const settings = loadSettings();
 
   // Auto-connect if setting enabled
-  if (settings.autoconnect && cachedToken && hasConfig()) {
+  if (settings.autoconnect && (cachedToken || isGuest) && hasConfig()) {
     // Notify renderer as soon as the window is ready so it shows "Подключение..."
     // immediately — before the tunnel actually starts.
     mainWindow.webContents.once('did-finish-load', () => {
@@ -879,6 +958,7 @@ ipcMain.handle('auth:logout', async () => {
   cachedToken = null;
   isGuest = false;
   deleteToken();
+  deleteGuestMode();
   try { await tunnelExec('stop'); } catch(e) {}
   updateTrayIcon('off');
   if (mainWindow) {
@@ -907,6 +987,7 @@ ipcMain.handle('auth:sessionExpired', async () => {
 ipcMain.handle('auth:guestLogin', async () => {
   isGuest = true;
   cachedToken = null;
+  saveGuestMode();
   if (mainWindow) {
     resizeWindowFor('main');
     mainWindow.loadFile('ui/main.html');
@@ -917,6 +998,7 @@ ipcMain.handle('auth:guestLogin', async () => {
 // Leave guest mode — back to login screen.
 ipcMain.handle('auth:exitGuest', async () => {
   isGuest = false;
+  deleteGuestMode();
   try { await tunnelExec('stop'); } catch(e) {}
   updateTrayIcon('off');
   if (mainWindow) {
@@ -974,13 +1056,21 @@ ipcMain.handle('config:import', async () => {
     }
     const saved = await saveConfig(confText);
     if (!saved) return { error: 'Не удалось сохранить конфигурацию.' };
+    _keytarConfigCached = true;
     return { ok: true };
   } catch(e) {
     return { error: 'Не удалось прочитать файл.' };
   }
 });
 
-ipcMain.handle('config:exists', () => hasConfig());
+ipcMain.handle('config:exists', async () => {
+  if (keytar) {
+    const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT).catch(() => null);
+    _keytarConfigCached = !!val;
+    return _keytarConfigCached;
+  }
+  return hasConfig();
+});
 
 ipcMain.handle('config:delete', async () => {
   try { await tunnelExec('stop'); } catch(e) {}
@@ -1001,6 +1091,7 @@ ipcMain.handle('settings:set', (event, newSettings) => {
   // Apply autostart change
   if (newSettings.autostart !== undefined) {
     setAutostart(newSettings.autostart);
+    _autostartCache = null; // invalidate cache after change
   }
 
   return merged;
@@ -1087,6 +1178,18 @@ ipcMain.handle('whitelist:save', async (event, list) => {
 });
 
 // ─── Connect time persistence ────────────────────────────
+
+function saveGuestMode() {
+  try { fs.writeFileSync(GUEST_FILE, '1', 'utf-8'); } catch(e) {}
+}
+
+function loadGuestMode() {
+  try { return fs.existsSync(GUEST_FILE); } catch(e) { return false; }
+}
+
+function deleteGuestMode() {
+  try { fs.unlinkSync(GUEST_FILE); } catch(e) {}
+}
 
 function saveConnectTime() {
   try {

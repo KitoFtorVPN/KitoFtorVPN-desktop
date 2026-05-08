@@ -1,7 +1,7 @@
 {
   "name": "kitoftorvpn",
   "productName": "KitoFtorVPN",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "KitoFtorVPN Desktop Client",
   "author": {
     "name": "KitoFtorVPN",
@@ -19,7 +19,8 @@
     "electron-builder": "^25.1.8"
   },
   "dependencies": {
-    "electron-updater": "^6.3.9"
+    "electron-updater": "^6.3.9",
+    "keytar": "^7.9.0"
   },
   "build": {
     "appId": "fun.kitoftorvpn.desktop",
@@ -35,6 +36,9 @@
       "ui/**/*",
       "!**/*.map",
       "!**/.DS_Store"
+    ],
+    "asarUnpack": [
+      "node_modules/keytar/**/*"
     ],
     "extraResources": [
       {
