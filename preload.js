@@ -49,6 +49,10 @@ contextBridge.exposeInMainWorld('api', {
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
   notifySubExpiring: (days) => ipcRenderer.invoke('notify:subExpiring', days),
 
+  // Updater
+  updateRestart: () => ipcRenderer.invoke('update:restart'),
+  updateLater: () => ipcRenderer.invoke('update:later'),
+
   // VPN events (main → renderer)
   onReconnecting: (cb) => {
     const listener = (_e, p) => cb(p);

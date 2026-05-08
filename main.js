@@ -721,7 +721,46 @@ async function createWindow() {
   }
 }
 
-// Second instance — show existing window
+let updateWindow = null;
+
+function openUpdateWindow(version) {
+  if (updateWindow && !updateWindow.isDestroyed()) {
+    updateWindow.focus();
+    return;
+  }
+
+  const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200, width: 380, height: 560 };
+  const w = 420, h = 460;
+  const x = mainBounds.x + Math.round((mainBounds.width - w) / 2);
+  const y = mainBounds.y + Math.round((mainBounds.height - h) / 2);
+
+  updateWindow = new BrowserWindow({
+    width: w, height: h,
+    x, y,
+    resizable: false,
+    frame: false,
+    transparent: false,
+    backgroundColor: '#0b1120',
+    icon: APP_ICON,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  updateWindow.loadFile('ui/update.html', { query: { version: version || '' } });
+  updateWindow.on('closed', () => { updateWindow = null; });
+}
+
+ipcMain.handle('update:restart', () => {
+  isQuitting = true;
+  setImmediate(() => autoUpdater && autoUpdater.quitAndInstall());
+});
+
+ipcMain.handle('update:later', () => {
+  if (updateWindow && !updateWindow.isDestroyed()) updateWindow.close();
+});
 app.on('second-instance', () => showMainWindow());
 
 app.whenReady().then(createWindow).then(() => {
@@ -733,21 +772,7 @@ app.whenReady().then(createWindow).then(() => {
     autoUpdater.autoInstallOnAppQuit = true;
     autoUpdater.on('error', (err) => console.error('updater:', err && err.message));
     autoUpdater.on('update-downloaded', (info) => {
-      // Offer immediate restart; otherwise it installs on quit.
-      dialog.showMessageBox(mainWindow, {
-        type: 'info',
-        buttons: ['Перезапустить сейчас', 'Позже'],
-        defaultId: 0,
-        cancelId: 1,
-        title: 'Обновление готово',
-        message: `Доступна новая версия ${info && info.version ? info.version : ''}`,
-        detail: 'Обновление скачано. Перезапустите приложение, чтобы установить его.',
-      }).then((r) => {
-        if (r.response === 0) {
-          isQuitting = true;
-          setImmediate(() => autoUpdater.quitAndInstall());
-        }
-      }).catch(() => {});
+      openUpdateWindow(info && info.version ? info.version : '');
     });
     // Delay a bit so the UI renders first, then check.
     setTimeout(() => {

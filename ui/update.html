@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Обновление — KitoFtorVPN</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --border: rgba(255,255,255,0.06);
+      --accent: #10b981;
+      --accent-hover: #34d399;
+      --text: #f1f5f9;
+      --text-dim: #94a3b8;
+      --text-muted: #475569;
+      --danger: #f43f5e;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      user-select: none;
+      overflow: hidden;
+    }
+
+    .titlebar {
+      display: flex; justify-content: space-between; align-items: center;
+      height: 38px; padding: 0 12px;
+      background: rgba(0,0,0,0.2);
+      border-bottom: 1px solid var(--border);
+      -webkit-app-region: drag; flex-shrink: 0;
+    }
+    .titlebar-title { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+    .titlebar-btns { display: flex; gap: 2px; -webkit-app-region: no-drag; }
+    .titlebar-btns button {
+      background: none; border: none; color: var(--text-muted);
+      cursor: pointer; width: 30px; height: 26px; border-radius: 6px;
+      display: flex; align-items: center; justify-content: center; transition: all 0.15s;
+    }
+    .titlebar-btns button:hover { background: rgba(255,255,255,0.06); color: var(--text-dim); }
+
+    .body {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      padding: 24px 24px 20px;
+      overflow: hidden;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+
+    .icon {
+      width: 44px; height: 44px; border-radius: 12px;
+      background: rgba(16,185,129,0.1);
+      border: 1px solid rgba(16,185,129,0.2);
+      display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .icon svg { color: var(--accent); }
+
+    .header-text {}
+    .header-app { font-size: 11px; color: var(--text-muted); font-weight: 500; margin-bottom: 2px; }
+    .header-title { font-size: 17px; font-weight: 700; color: var(--text); }
+    .header-sub { font-size: 13px; color: var(--text-dim); margin-top: 2px; }
+
+    .divider {
+      height: 1px; background: var(--border); margin-bottom: 16px;
+    }
+
+    .changelog-label {
+      font-size: 11px; font-weight: 600; color: var(--text-muted);
+      text-transform: uppercase; letter-spacing: 0.06em;
+      margin-bottom: 10px;
+    }
+
+    .changelog {
+      flex: 1;
+      overflow-y: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+      font-size: 13px;
+      color: var(--text-dim);
+      line-height: 1.7;
+      margin-bottom: 18px;
+    }
+    .changelog::-webkit-scrollbar { width: 4px; }
+    .changelog::-webkit-scrollbar-track { background: transparent; }
+    .changelog::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
+
+    .changelog.loading {
+      display: flex; align-items: center; justify-content: center;
+      color: var(--text-muted);
+    }
+
+    .changelog p { margin-bottom: 8px; }
+    .changelog p:last-child { margin-bottom: 0; }
+    .changelog ul { padding-left: 18px; }
+    .changelog li { margin-bottom: 4px; }
+    .changelog h1, .changelog h2, .changelog h3 {
+      font-size: 13px; font-weight: 600; color: var(--text);
+      margin-bottom: 8px; margin-top: 12px;
+    }
+    .changelog h1:first-child, .changelog h2:first-child, .changelog h3:first-child {
+      margin-top: 0;
+    }
+    .changelog strong { color: var(--text); font-weight: 600; }
+    .changelog code {
+      background: rgba(255,255,255,0.06); border-radius: 4px;
+      padding: 1px 5px; font-family: 'Consolas', monospace; font-size: 12px;
+    }
+
+    .actions {
+      display: flex; gap: 10px; flex-shrink: 0;
+    }
+
+    .btn {
+      flex: 1; height: 40px; border-radius: 10px;
+      border: none; font-family: inherit; font-size: 14px; font-weight: 600;
+      cursor: pointer; transition: all 0.15s;
+      display: flex; align-items: center; justify-content: center; gap: 7px;
+    }
+
+    .btn-primary {
+      background: var(--accent);
+      color: #fff;
+    }
+    .btn-primary:hover { background: var(--accent-hover); }
+
+    .btn-secondary {
+      background: var(--surface);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      flex: 0 0 auto;
+      padding: 0 20px;
+    }
+    .btn-secondary:hover { background: rgba(255,255,255,0.04); color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="titlebar">
+    <span class="titlebar-title">KitoFtorVPN — Обновление</span>
+    <div class="titlebar-btns">
+      <button onclick="later()">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1 1l8 8M9 1l-8 8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="body">
+    <div class="header">
+      <div class="icon">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+          <polyline points="17 8 12 3 7 8"/>
+          <line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+      </div>
+      <div class="header-text">
+        <div class="header-app">KitoFtorVPN</div>
+        <div class="header-title" id="versionTitle">Доступно обновление</div>
+        <div class="header-sub" id="versionSub">Новая версия скачана и готова к установке</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="changelog-label">Что нового</div>
+    <div class="changelog loading" id="changelog">Загрузка...</div>
+
+    <div class="actions">
+      <button class="btn btn-secondary" onclick="later()">Позже</button>
+      <button class="btn btn-primary" onclick="restart()">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"/>
+          <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
+        </svg>
+        Перезапустить сейчас
+      </button>
+    </div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const version = params.get('version') || '';
+    const owner = 'KitoFtorVPN';
+    const repo = 'KitoFtorVPN-desktop';
+
+    if (version) {
+      document.getElementById('versionTitle').textContent = `Доступна версия ${version}`;
+    }
+
+    async function loadChangelog() {
+      const el = document.getElementById('changelog');
+      try {
+        const tag = version ? `v${version}` : 'latest';
+        const url = tag === 'latest'
+          ? `https://api.github.com/repos/${owner}/${repo}/releases/latest`
+          : `https://api.github.com/repos/${owner}/${repo}/releases/tags/${tag}`;
+
+        const res = await fetch(url, {
+          headers: { 'Accept': 'application/vnd.github.v3+json' }
+        });
+        if (!res.ok) throw new Error('not found');
+        const data = await res.json();
+
+        el.classList.remove('loading');
+
+        const body = (data.body || '').trim();
+        if (!body) {
+          el.innerHTML = '<p style="color:var(--text-muted)">Описание изменений не указано.</p>';
+          return;
+        }
+
+        // Simple markdown-to-html
+        el.innerHTML = parseMarkdown(body);
+      } catch(e) {
+        el.classList.remove('loading');
+        el.innerHTML = '<p style="color:var(--text-muted)">Не удалось загрузить список изменений.</p>';
+      }
+    }
+
+    function parseMarkdown(md) {
+      return md
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/### (.+)/g, '<h3>$1</h3>')
+        .replace(/## (.+)/g, '<h2>$1</h2>')
+        .replace(/# (.+)/g, '<h1>$1</h1>')
+        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/^[-*] (.+)/gm, '<li>$1</li>')
+        .replace(/(<li>.*<\/li>)/gs, '<ul>$1</ul>')
+        .replace(/\n\n/g, '</p><p>')
+        .replace(/^(?!<[hul])(.+)$/gm, (m) => m.startsWith('<') ? m : `<p>${m}</p>`)
+        .replace(/<p><\/p>/g, '');
+    }
+
+    function restart() {
+      api.updateRestart();
+    }
+
+    function later() {
+      api.updateLater();
+    }
+
+    loadChangelog();
+  </script>
+</body>
+</html>
