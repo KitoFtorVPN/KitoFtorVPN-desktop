@@ -105,10 +105,61 @@ function isIpOrCidr(s) {
   return /^[\d./]+$/.test(s);
 }
 
+// PERFORMANCE NOTE: this used to resolve every whitelist domain one at a
+// time (for...await), with no per-lookup timeout. A single slow/unreachable
+// domain (no A record, slow upstream resolver, etc.) could stall for
+// several seconds, and with ~30 domains in the list that easily added up
+// to the 20-30s connect/disconnect times. Two fixes, same output:
+//   1. All domains are resolved concurrently (Promise.all) instead of
+//      sequentially — wall time becomes "the slowest single lookup"
+//      instead of "the sum of every lookup".
+//   2. Each lookup gets a hard timeout (RESOLVE_TIMEOUT_MS) so one bad
+//      domain can't drag the whole whitelist down; it's just skipped,
+//      same as today's "resolve failed" case already does.
+// A short in-memory cache also avoids re-resolving the same domains on
+// every connect/disconnect within a short window (domains here are static
+// service whitelists, not something that needs resolving fresh every time).
+const RESOLVE_TIMEOUT_MS = 3000;
+const RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const _resolveCache = new Map(); // entry -> { resolved: Set<ip>, at: number }
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ]);
+}
+
+async function resolveDomainCached(entry) {
+  const cached = _resolveCache.get(entry);
+  if (cached && (Date.now() - cached.at) < RESOLVE_CACHE_TTL_MS) {
+    return cached.resolved;
+  }
+
+  let resolved = new Set();
+  try {
+    const addrs = await withTimeout(dns.resolve4(entry), RESOLVE_TIMEOUT_MS);
+    for (const a of addrs) resolved.add(a);
+  } catch(e) {
+    // Fallback: dns.lookup (uses system resolver).
+    try {
+      const all = await withTimeout(dns.lookup(entry, { all: true, family: 4 }), RESOLVE_TIMEOUT_MS);
+      for (const r of all) resolved.add(r.address);
+    } catch(e2) {
+      console.error(`whitelist: resolve ${entry} failed`);
+    }
+  }
+
+  _resolveCache.set(entry, { resolved, at: Date.now() });
+  return resolved;
+}
+
 // Resolves whitelist entries to a Set of IPs/CIDRs. For domains with multiple IPs
 // (typical for CDN), expands each IP to its /24 subnet — matches VPN.py behaviour.
 async function resolveWhitelistEntries(entries) {
   const ips = new Set();
+  const domains = [];
+
   for (const raw of entries) {
     const entry = cleanWhitelistEntry(raw);
     if (!entry) continue;
@@ -117,24 +168,13 @@ async function resolveWhitelistEntries(entries) {
       ips.add(entry);
       continue;
     }
+    domains.push(entry);
+  }
 
-    // Domain — resolve A records (IPv4 only for now).
-    let resolved = new Set();
-    try {
-      const addrs = await dns.resolve4(entry);
-      for (const a of addrs) resolved.add(a);
-    } catch(e) {
-      // Fallback: dns.lookup (uses system resolver).
-      try {
-        const all = await dns.lookup(entry, { all: true, family: 4 });
-        for (const r of all) resolved.add(r.address);
-      } catch(e2) {
-        console.error(`whitelist: resolve ${entry} failed`);
-      }
-    }
+  // Resolve every domain concurrently instead of one at a time.
+  const results = await Promise.all(domains.map(d => resolveDomainCached(d)));
 
-    if (resolved.size === 0) continue;
-
+  for (const resolved of results) {
     // Expand every resolved IP to its /24 subnet. This helps with CDNs where
     // a hostname resolves to a rotating set of IPs within the same /24 block.
     for (const ip of resolved) {
@@ -598,13 +638,20 @@ function showMainWindow() {
 
 async function quitApp() {
   isQuitting = true;
-  // Stop the VPN tunnel before exiting — otherwise the Windows service
-  // keeps running in the background and the user's traffic still goes
-  // through VPN even though the app is closed.
+  // Stop the VPN tunnel first — tears down routes/adapter cleanly.
   try {
     await tunnelExec('stop');
   } catch(e) {
     // Ignore — either tunnel wasn't running or already stopped.
+  }
+  // Then stop the persistent background Windows service itself. Normal
+  // connect/disconnect leaves this service running on purpose (that's what
+  // makes the next "Подключиться" instant), but a full app exit via tray
+  // "Выход" should leave nothing behind in Task Manager / Services.
+  try {
+    await tunnelExec('service-stop');
+  } catch(e) {
+    console.error('quitApp: service-stop failed:', e.message);
   }
   deleteConnectTime();
   if (tray) { tray.destroy(); tray = null; }
@@ -753,8 +800,25 @@ function openUpdateWindow(version) {
   updateWindow.on('closed', () => { updateWindow = null; });
 }
 
-ipcMain.handle('update:restart', () => {
+ipcMain.handle('update:restart', async () => {
   isQuitting = true;
+  // Same cleanup as quitApp()'s tray "Выход": stop the tunnel, then the
+  // persistent background service, before handing off to the updater.
+  // quitAndInstall() only quits the Electron process — it knows nothing
+  // about kitoftor-tunnel.exe or its Windows service, so without this the
+  // tunnel/service would be left running and the freshly-downloaded
+  // installer would hit the same "VPN is running, close it manually" wall
+  // this same cleanup already fixes for a manually-launched installer.
+  try {
+    await tunnelExec('stop');
+  } catch(e) {
+    // Ignore — either tunnel wasn't running or already stopped.
+  }
+  try {
+    await tunnelExec('service-stop');
+  } catch(e) {
+    console.error('update:restart: service-stop failed:', e.message);
+  }
   setImmediate(() => autoUpdater && autoUpdater.quitAndInstall());
 });
 
@@ -764,6 +828,15 @@ ipcMain.handle('update:later', () => {
 app.on('second-instance', () => showMainWindow());
 
 app.whenReady().then(createWindow).then(() => {
+  // Warm up the background tunnel service right away. The service is now
+  // persistent (created once, stays running) instead of being recreated on
+  // every connect — this call makes sure it's already up by the time the
+  // user clicks "Connect", so the very first connect of a session is fast
+  // too, not just subsequent ones. Failures here are silent on purpose:
+  // if this fails (e.g. somehow not elevated), the normal connect flow
+  // will retry the same install-and-start logic anyway.
+  tunnelExec('status').catch(() => {});
+
   // Check for updates only in packaged app — in dev there's no published
   // release to compare against, and electron-updater throws on dev_app_update.yml missing.
   if (!app.isPackaged || !autoUpdater) return;
@@ -796,6 +869,7 @@ app.on('before-quit', (event) => {
   event.preventDefault();
   (async () => {
     try { await tunnelExec('stop'); } catch(e) {}
+    try { await tunnelExec('service-stop'); } catch(e) {}
     deleteConnectTime();
     app.exit(0);
   })();
@@ -1236,6 +1310,30 @@ function deleteConnectTime() {
 
 // ─── IPC: Tunnel management ──────────────────────────────
 
+// Technical errors from the tunnel process (Go/Windows API) come back in
+// English (e.g. "SCM connect failed", "CreateTUN failed: ..."). Showing
+// that directly in the UI looks broken to a non-technical user. This maps
+// the few cases we can give useful advice for, and otherwise replaces the
+// raw text with one calm, generic message in Russian — the real text is
+// still logged to debug.log for support purposes.
+function friendlyTunnelError(message) {
+  const text = String(message || '');
+  if (/need admin|access is denied|отказано в доступе/i.test(text)) {
+    return 'Недостаточно прав. Запустите приложение от имени администратора.';
+  }
+  if (/CreateTUN|wintun/i.test(text)) {
+    return 'Не удалось создать сетевой адаптер VPN. Попробуйте перезапустить приложение или компьютер.';
+  }
+  if (/timeout|timed out/i.test(text)) {
+    return 'Подключение занимает слишком много времени. Проверьте интернет-соединение и попробуйте снова.';
+  }
+  if (/parse failed/i.test(text)) {
+    return 'Файл конфигурации повреждён. Загрузите .conf файл заново.';
+  }
+  console.error('tunnel error (raw):', text);
+  return 'Не удалось подключиться. Попробуйте ещё раз или перезапустите приложение.';
+}
+
 function tunnelExec(command, arg) {
   return new Promise((resolve, reject) => {
     const args = arg ? [command, arg] : [command];
@@ -1284,7 +1382,7 @@ ipcMain.handle('vpn:connect', async () => {
     return { ok: true, result };
   } catch(e) {
     updateTrayIcon('off');
-    return { error: e.message };
+    return { error: friendlyTunnelError(e.message) };
   }
 });
 
@@ -1295,7 +1393,7 @@ ipcMain.handle('vpn:disconnect', async () => {
     updateTrayIcon('off');
     return { ok: true, result };
   } catch(e) {
-    return { error: e.message };
+    return { error: friendlyTunnelError(e.message) };
   }
 });
 
