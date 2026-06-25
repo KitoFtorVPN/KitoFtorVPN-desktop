@@ -1,7 +1,7 @@
 {
   "name": "kitoftorvpn",
   "productName": "KitoFtorVPN",
-  "version": "1.1.1",
+  "version": "1.1.3",
   "description": "KitoFtorVPN Desktop Client",
   "author": {
     "name": "KitoFtorVPN",
@@ -73,14 +73,14 @@
       "oneClick": false,
       "perMachine": true,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true,
+      "createDesktopShortcut": false,
       "createStartMenuShortcut": true,
       "shortcutName": "KitoFtorVPN",
       "installerIcon": "build/installer-icon.ico",
       "uninstallerIcon": "build/installer-icon.ico",
       "installerHeaderIcon": "build/icon.ico",
       "deleteAppDataOnUninstall": false,
-      "include": "build/installer.nsh"
+      "warningsAsErrors": false
     },
     "publish": [
       {
