@@ -62,6 +62,7 @@ KitoFtorVPN/
 │   ├── main.html
 │   ├── settings.html
 │   ├── whitelist.html
+|   ├── update.html
 │   └── import.html
 ├── bin/              — Go-хелпер и TUN-драйвер
 │   ├── kitoftor-tunnel.exe
