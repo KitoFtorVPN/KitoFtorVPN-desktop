@@ -83,11 +83,18 @@ async function stopTunnelOnExit() {
   deleteConnectTime();
 }
 
-if (process.platform === 'win32') {
-  powerMonitor.setShutdownHandler(async () => {
-    await stopTunnelOnExit();
-    return true; // tell Windows it's fine to continue shutting down now
-  });
+// NOTE: registering this inside app.whenReady() (further down) instead of
+// here at top-level — some Electron builds throw/misbehave ("...is not a
+// function") if powerMonitor is touched before the app 'ready' event, per
+// Electron's own docs ("you cannot require or use this module until the
+// ready event of the app module is emitted").
+function registerShutdownHandler() {
+  if (process.platform === 'win32') {
+    powerMonitor.setShutdownHandler(async () => {
+      await stopTunnelOnExit();
+      return true; // tell Windows it's fine to continue shutting down now
+    });
+  }
 }
 
 // Prevent multiple instances
@@ -987,6 +994,11 @@ async function maybeShowUpdateWindow(latest) {
 }
 
 app.whenReady().then(createWindow).then(() => {
+  // Register as early as possible once the app is ready — see the note
+  // next to registerShutdownHandler's definition for why this can't be
+  // done at module top-level.
+  try { registerShutdownHandler(); } catch (e) { console.error('registerShutdownHandler:', e); }
+
   // Re-sync autostart with the saved setting on every launch. After an
   // app update (NSIS replaces the .exe and can wipe/relocate the Task
   // Scheduler entry), the saved "autostart: true" setting would otherwise
@@ -1060,11 +1072,32 @@ app.whenReady().then(createWindow).then(() => {
       } catch(e) {}
       openUpdateWindow(version, 'downloaded');
     });
-    // Delay a bit so the UI renders first, then check.
-    setTimeout(() => {
-      logUpdate('calling checkForUpdates()');
-      autoUpdater.checkForUpdates().catch(e => { console.error('updater check:', e); logUpdate(`checkForUpdates rejected: ${e && e.stack || e}`); });
-    }, 5000);
+    // С автозапуском и автоподключением VPN сеть/DNS на старте может быть
+    // ещё не готова (адаптер поднимается, маршруты и DNS перестраиваются),
+    // и checkForUpdates() падает с ERR_NAME_NOT_RESOLVED / ERR_INTERNET_DISCONNECTED
+    // ещё до того, как туннель встал. Поэтому: 1) увеличенная начальная
+    // задержка, 2) автоматический повтор именно на сетевые ошибки, с паузами
+    // между попытками, чтобы дать VPN время подняться.
+    const NETWORK_ERROR_CODES = ['ERR_NAME_NOT_RESOLVED', 'ERR_INTERNET_DISCONNECTED', 'ERR_NETWORK_CHANGED', 'ERR_CONNECTION_RESET', 'ERR_PROXY_CONNECTION_FAILED', 'ERR_CONNECTION_TIMED_OUT'];
+    const isNetworkError = (e) => {
+      const msg = (e && (e.message || e.toString())) || '';
+      return NETWORK_ERROR_CODES.some(code => msg.includes(code));
+    };
+    const MAX_UPDATE_CHECK_RETRIES = 4;
+    const RETRY_DELAY_MS = 10000; // 10 сек между попытками
+    const attemptCheckForUpdates = (attempt) => {
+      logUpdate(`calling checkForUpdates() (attempt ${attempt}/${MAX_UPDATE_CHECK_RETRIES})`);
+      autoUpdater.checkForUpdates().catch(e => {
+        console.error('updater check:', e);
+        logUpdate(`checkForUpdates rejected: ${e && e.stack || e}`);
+        if (isNetworkError(e) && attempt < MAX_UPDATE_CHECK_RETRIES) {
+          logUpdate(`network error detected, retrying in ${RETRY_DELAY_MS}ms`);
+          setTimeout(() => attemptCheckForUpdates(attempt + 1), RETRY_DELAY_MS);
+        }
+      });
+    };
+    // Delay a bit so the UI renders first (and VPN autoconnect has a head start), then check.
+    setTimeout(() => attemptCheckForUpdates(1), 15000);
   } catch(e) {
     console.error('updater init:', e);
     logUpdate(`init throw: ${e && e.stack || e}`);
