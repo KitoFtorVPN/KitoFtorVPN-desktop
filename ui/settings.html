@@ -46,36 +46,45 @@
     .titlebar-btns button:hover { background: rgba(255,255,255,0.06); color: var(--text-dim); }
 
     .content {
-      flex: 1; padding: 20px 24px;
+      flex: 1; padding: 16px 24px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
     }
+    .content::-webkit-scrollbar { width: 4px; }
+    .content::-webkit-scrollbar-track { background: transparent; }
+    .content::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 2px; }
 
     .section-title {
       font-size: 11px; font-weight: 600;
       color: var(--text-muted);
       text-transform: uppercase;
       letter-spacing: 0.8px;
-      margin-bottom: 12px;
+      margin-bottom: 2px;
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
     }
+    .section-title:first-child { margin-top: 0; padding-top: 0; border-top: none; }
 
     .setting-row {
       display: flex; justify-content: space-between; align-items: center;
-      padding: 14px 16px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      margin-bottom: 8px;
+      padding: 7px 2px;
     }
 
     .setting-info {
       flex: 1; margin-right: 16px;
+      text-align: left;
     }
     .setting-label {
       font-size: 14px; font-weight: 600;
       margin-bottom: 2px;
+      text-align: left;
     }
     .setting-desc {
       font-size: 12px; color: var(--text-dim);
       line-height: 1.4;
+      text-align: left;
     }
 
     /* Toggle switch */
@@ -112,7 +121,9 @@
     }
 
     .version {
-      margin-top: 20px;
+      margin-top: auto;
+      padding-top: 12px;
+      padding-bottom: 5px;
       text-align: center;
       font-size: 13px;
       font-weight: 600;
@@ -121,17 +132,17 @@
 
     .btn-action {
       display: flex; align-items: center; justify-content: space-between;
-      width: 100%; padding: 14px 16px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      margin-bottom: 8px;
-      cursor: pointer; transition: all 0.15s;
+      width: 100%; padding: 7px 2px;
+      background: none;
+      border: none;
+      cursor: pointer; transition: background 0.15s;
       font-family: inherit;
+      text-align: left;
     }
-    .btn-action:hover { border-color: rgba(255,255,255,0.12); background: rgba(255,255,255,0.02); }
-    .btn-action.danger:hover { border-color: rgba(244,63,94,0.2); background: rgba(244,63,94,0.04); }
-    .btn-action-label { font-size: 14px; font-weight: 600; color: var(--text); }
+    .btn-action > div { text-align: left; }
+    .btn-action:hover { background: rgba(255,255,255,0.03); }
+    .btn-action.danger:hover { background: rgba(244,63,94,0.05); }
+    .btn-action-label { font-size: 14px; font-weight: 600; color: var(--text); text-align: left; }
     .btn-action-desc { font-size: 12px; color: var(--text-dim); line-height: 1.4; margin-top: 2px; text-align: left; }
     .btn-action.danger .btn-action-label { color: var(--danger); }
     .btn-action svg { flex-shrink: 0; color: var(--text-muted); }
@@ -195,7 +206,7 @@
       </label>
     </div>
 
-    <div class="section-title" style="margin-top:16px">Маршрутизация</div>
+    <div class="section-title">Маршрутизация</div>
 
     <div class="setting-row" style="cursor:pointer" onclick="api.openWhitelist()">
       <div class="setting-info">
@@ -207,7 +218,7 @@
       </svg>
     </div>
 
-    <div class="section-title" style="margin-top:16px">Конфигурация</div>
+    <div class="section-title">Конфигурация</div>
 
     <button class="btn-action" id="changeConfBtn" onclick="doChangeConfig()">
       <div>
@@ -229,6 +240,29 @@
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <polyline points="3 6 5 6 21 6"/>
         <path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>
+      </svg>
+    </button>
+
+    <div class="section-title">Обновления</div>
+
+    <div class="setting-row">
+      <div class="setting-info">
+        <div class="setting-label">Не проверять обновления</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="updateSkipPrompt" onchange="toggleUpdateSkipPrompt()">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <button class="btn-action" id="checkUpdateBtn" onclick="doCheckUpdate()">
+      <div>
+        <div class="btn-action-label" id="checkUpdateLabel">Проверить обновление</div>
+        <div class="btn-action-desc" id="checkUpdateDesc">Узнать, доступна ли новая версия</div>
+      </div>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="23 4 23 10 17 10"/>
+        <path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/>
       </svg>
     </button>
 
@@ -255,6 +289,7 @@
       const s = await api.getSettings();
       document.getElementById('autostart').checked = s.autostart || false;
       document.getElementById('autoconnect').checked = s.autoconnect || false;
+      document.getElementById('updateSkipPrompt').checked = s.updateSkipPrompt || false;
       try {
         const v = await api.getVersion();
         document.getElementById('version').textContent = `KitoFtorVPN v${v}`;
@@ -269,6 +304,46 @@
 
     async function toggleAutoconnect() {
       await api.setSettings({ autoconnect: document.getElementById('autoconnect').checked });
+    }
+
+    async function toggleUpdateSkipPrompt() {
+      // Сохраняется автоматически — без отдельной кнопки "Сохранить",
+      // как и остальные переключатели на этом экране.
+      await api.setSettings({ updateSkipPrompt: document.getElementById('updateSkipPrompt').checked });
+    }
+
+    async function doCheckUpdate() {
+      const btn = document.getElementById('checkUpdateBtn');
+      const label = document.getElementById('checkUpdateLabel');
+      const desc = document.getElementById('checkUpdateDesc');
+      const originalLabel = label.textContent;
+      const originalDesc = desc.textContent;
+
+      btn.style.pointerEvents = 'none';
+      label.textContent = 'Проверка...';
+      desc.textContent = 'Это может занять несколько секунд';
+
+      try {
+        const res = await api.updateCheckManual();
+        if (res && res.error) {
+          desc.textContent = 'Не удалось проверить обновление';
+        } else if (res && res.upToDate) {
+          label.textContent = 'У вас последняя версия';
+          desc.textContent = 'Обновления не требуются';
+        } else {
+          // Найдено обновление — окно обновления уже открыто main-процессом.
+          label.textContent = originalLabel;
+          desc.textContent = originalDesc;
+        }
+      } catch(e) {
+        desc.textContent = 'Не удалось проверить обновление';
+      }
+
+      btn.style.pointerEvents = '';
+      setTimeout(() => {
+        label.textContent = originalLabel;
+        desc.textContent = originalDesc;
+      }, 3000);
     }
 
     function confirmDeleteConfig() {

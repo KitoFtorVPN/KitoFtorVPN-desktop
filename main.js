@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage, screen, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage, screen, Notification, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -43,6 +43,53 @@ function showNotification(title, body, onlyWhenHidden = false) {
 // Required for Windows toast notifications to work (both dev and packaged).
 app.setAppUserModelId('fun.kitoftorvpn.desktop');
 
+// ─── Guaranteed teardown on system shutdown/restart ──────
+//
+// before-quit (further down) is NOT enough on its own: Windows only gives
+// a normal foreground app a few seconds to react to WM_QUERYENDSESSION
+// before it either shows "this app is preventing shutdown" or just kills
+// the process outright. If tunnelExec hadn't finished yet at that point,
+// the tunnel and its routes were left running — which is the whole bug
+// this fixes.
+//
+// powerMonitor.setShutdownHandler (Windows-only) is different: returning
+// a Promise from it actually makes Windows wait for that promise before
+// continuing the shutdown, the same mechanism a real "block shutdown"
+// app uses. Registering it this early (before whenReady) matters per
+// Electron's own docs — it has to be in place before the shutdown sequence
+// can start, not added later once the window exists.
+//
+// stopTunnelOnExit() is shared with before-quit further down so both
+// paths (user clicks "Выход" vs. Windows shutting the whole machine down)
+// go through the exact same teardown and can't drift apart again.
+let tunnelStopped = false;
+async function stopTunnelOnExit() {
+  if (tunnelStopped) return;
+  tunnelStopped = true;
+  // Hard cap: Windows' own patience for setShutdownHandler is finite too
+  // (a few seconds in practice) — if tunnelExec is somehow stuck (killed
+  // antivirus scan on the exe, disk thrashing, whatever), we must not hang
+  // the whole machine's shutdown forever waiting on it. Better to return
+  // and let the next boot's stale-marker cleanup (kitoftor-tunnel service,
+  // see hadUncleanPriorRun) finish the job than to block a shutdown
+  // indefinitely.
+  await Promise.race([
+    (async () => {
+      try { await tunnelExec('stop'); } catch (e) {}
+      try { await tunnelExec('service-stop'); } catch (e) {}
+    })(),
+    new Promise((resolve) => setTimeout(resolve, 4000)),
+  ]);
+  deleteConnectTime();
+}
+
+if (process.platform === 'win32') {
+  powerMonitor.setShutdownHandler(async () => {
+    await stopTunnelOnExit();
+    return true; // tell Windows it's fine to continue shutting down now
+  });
+}
+
 // Prevent multiple instances
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) { app.quit(); }
@@ -62,10 +109,15 @@ let isQuitting = false;
 function loadSettings() {
   try {
     if (fs.existsSync(SETTINGS_FILE)) {
-      return JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+      const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
+      return {
+        autostart: false, autoconnect: false, whitelist: [],
+        updateSkipPrompt: false, updatePendingVersion: null,
+        ...loaded,
+      };
     }
   } catch(e) {}
-  return { autostart: false, autoconnect: false, whitelist: [] };
+  return { autostart: false, autoconnect: false, whitelist: [], updateSkipPrompt: false, updatePendingVersion: null };
 }
 
 function saveSettings(settings) {
@@ -105,10 +157,61 @@ function isIpOrCidr(s) {
   return /^[\d./]+$/.test(s);
 }
 
+// PERFORMANCE NOTE: this used to resolve every whitelist domain one at a
+// time (for...await), with no per-lookup timeout. A single slow/unreachable
+// domain (no A record, slow upstream resolver, etc.) could stall for
+// several seconds, and with ~30 domains in the list that easily added up
+// to the 20-30s connect/disconnect times. Two fixes, same output:
+//   1. All domains are resolved concurrently (Promise.all) instead of
+//      sequentially — wall time becomes "the slowest single lookup"
+//      instead of "the sum of every lookup".
+//   2. Each lookup gets a hard timeout (RESOLVE_TIMEOUT_MS) so one bad
+//      domain can't drag the whole whitelist down; it's just skipped,
+//      same as today's "resolve failed" case already does.
+// A short in-memory cache also avoids re-resolving the same domains on
+// every connect/disconnect within a short window (domains here are static
+// service whitelists, not something that needs resolving fresh every time).
+const RESOLVE_TIMEOUT_MS = 3000;
+const RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const _resolveCache = new Map(); // entry -> { resolved: Set<ip>, at: number }
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ]);
+}
+
+async function resolveDomainCached(entry) {
+  const cached = _resolveCache.get(entry);
+  if (cached && (Date.now() - cached.at) < RESOLVE_CACHE_TTL_MS) {
+    return cached.resolved;
+  }
+
+  let resolved = new Set();
+  try {
+    const addrs = await withTimeout(dns.resolve4(entry), RESOLVE_TIMEOUT_MS);
+    for (const a of addrs) resolved.add(a);
+  } catch(e) {
+    // Fallback: dns.lookup (uses system resolver).
+    try {
+      const all = await withTimeout(dns.lookup(entry, { all: true, family: 4 }), RESOLVE_TIMEOUT_MS);
+      for (const r of all) resolved.add(r.address);
+    } catch(e2) {
+      console.error(`whitelist: resolve ${entry} failed`);
+    }
+  }
+
+  _resolveCache.set(entry, { resolved, at: Date.now() });
+  return resolved;
+}
+
 // Resolves whitelist entries to a Set of IPs/CIDRs. For domains with multiple IPs
 // (typical for CDN), expands each IP to its /24 subnet — matches VPN.py behaviour.
 async function resolveWhitelistEntries(entries) {
   const ips = new Set();
+  const domains = [];
+
   for (const raw of entries) {
     const entry = cleanWhitelistEntry(raw);
     if (!entry) continue;
@@ -117,24 +220,13 @@ async function resolveWhitelistEntries(entries) {
       ips.add(entry);
       continue;
     }
+    domains.push(entry);
+  }
 
-    // Domain — resolve A records (IPv4 only for now).
-    let resolved = new Set();
-    try {
-      const addrs = await dns.resolve4(entry);
-      for (const a of addrs) resolved.add(a);
-    } catch(e) {
-      // Fallback: dns.lookup (uses system resolver).
-      try {
-        const all = await dns.lookup(entry, { all: true, family: 4 });
-        for (const r of all) resolved.add(r.address);
-      } catch(e2) {
-        console.error(`whitelist: resolve ${entry} failed`);
-      }
-    }
+  // Resolve every domain concurrently instead of one at a time.
+  const results = await Promise.all(domains.map(d => resolveDomainCached(d)));
 
-    if (resolved.size === 0) continue;
-
+  for (const resolved of results) {
     // Expand every resolved IP to its /24 subnet. This helps with CDNs where
     // a hostname resolves to a rotating set of IPs within the same /24 block.
     for (const ip of resolved) {
@@ -598,13 +690,20 @@ function showMainWindow() {
 
 async function quitApp() {
   isQuitting = true;
-  // Stop the VPN tunnel before exiting — otherwise the Windows service
-  // keeps running in the background and the user's traffic still goes
-  // through VPN even though the app is closed.
+  // Stop the VPN tunnel first — tears down routes/adapter cleanly.
   try {
     await tunnelExec('stop');
   } catch(e) {
     // Ignore — either tunnel wasn't running or already stopped.
+  }
+  // Then stop the persistent background Windows service itself. Normal
+  // connect/disconnect leaves this service running on purpose (that's what
+  // makes the next "Подключиться" instant), but a full app exit via tray
+  // "Выход" should leave nothing behind in Task Manager / Services.
+  try {
+    await tunnelExec('service-stop');
+  } catch(e) {
+    console.error('quitApp: service-stop failed:', e.message);
   }
   deleteConnectTime();
   if (tray) { tray.destroy(); tray = null; }
@@ -613,8 +712,8 @@ async function quitApp() {
 
 // ─── Window ──────────────────────────────────────────────
 
-const LOGIN_SIZE = { width: 400, height: 520 };
-const MAIN_SIZE = { width: 380, height: 560 };
+const LOGIN_SIZE = { width: 310, height: 520 };
+const MAIN_SIZE = { width: 310, height: 500 };
 
 function resizeWindowFor(page) {
   if (!mainWindow || mainWindow.isDestroyed()) return;
@@ -681,8 +780,15 @@ async function createWindow() {
 
   const settings = loadSettings();
 
-  // Auto-connect if setting enabled
-  if (settings.autoconnect && (cachedToken || isGuest) && hasConfig()) {
+  // Auto-connect if setting enabled.
+  // NOTE: we deliberately do NOT use the synchronous hasConfig() helper here.
+  // When configs are stored via keytar (the normal path), hasConfig() relies
+  // on _keytarConfigCached, which is only warmed up after the renderer calls
+  // config:exists — i.e. *after* this point on a fresh start. That made
+  // autoconnect silently never fire even with a real saved config and both
+  // toggles correctly enabled. loadConfig() itself awaits keytar directly,
+  // so we check the actual config up front instead.
+  if (settings.autoconnect && (cachedToken || isGuest)) {
     // Notify renderer as soon as the window is ready so it shows "Подключение..."
     // immediately — before the tunnel actually starts.
     mainWindow.webContents.once('did-finish-load', () => {
@@ -693,8 +799,24 @@ async function createWindow() {
 
     setTimeout(async () => {
       try {
+        // If the service already has a tunnel up (e.g. it survived a
+        // Windows Fast Startup "shutdown" that didn't actually tear the
+        // session down — the whole reason this got fixed), don't tear it
+        // down just to bring up an identical one. Just adopt its real
+        // connectStart and reflect "on" in the UI.
+        const already = await tunnelStatusFull();
+        if (already.state === 'RUNNING') {
+          if (already.connectStartMs) saveConnectTime(already.connectStartMs);
+          updateTrayIcon('on');
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vpn:autoconnected', { ok: true });
+          }
+          return;
+        }
+
         let conf = await loadConfig();
         if (conf) {
+          _keytarConfigCached = true; // we just confirmed a config exists — keep hasConfig() in sync
           if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
             try { conf = await applyWhitelistToConfig(conf, settings.whitelist); } catch(e) {}
           }
@@ -708,6 +830,12 @@ async function createWindow() {
           showNotification('KitoFtorVPN', 'VPN подключён', true);
           if (mainWindow && !mainWindow.isDestroyed()) {
             mainWindow.webContents.send('vpn:autoconnected', { ok: true });
+          }
+        } else {
+          // No config to connect with — tell the renderer to fall back to
+          // the normal "off" state instead of being stuck on "Подключение...".
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('vpn:autoconnected', { ok: false });
           }
         }
       } catch(e) {
@@ -723,8 +851,11 @@ async function createWindow() {
 
 let updateWindow = null;
 
-function openUpdateWindow(version) {
+// stage: 'available' (шаг 1 — "Доступна версия X, Обновить/Позже")
+//     or 'downloaded' (шаг 2 — "Скачано, установить?")
+function openUpdateWindow(version, stage) {
   if (updateWindow && !updateWindow.isDestroyed()) {
+    updateWindow.webContents.send('update:setStage', { stage, version });
     updateWindow.focus();
     return;
   }
@@ -749,37 +880,194 @@ function openUpdateWindow(version) {
     },
   });
 
-  updateWindow.loadFile('ui/update.html', { query: { version: version || '' } });
+  updateWindow.loadFile('ui/update.html', { query: { version: version || '', stage: stage || 'available' } });
   updateWindow.on('closed', () => { updateWindow = null; });
 }
 
-ipcMain.handle('update:restart', () => {
+// Отправляет прогресс скачивания в уже открытое окно обновления (если оно
+// открыто) — окно само решает, как его отрисовать (полоска внизу шага 1).
+function sendUpdateProgress(percent) {
+  if (updateWindow && !updateWindow.isDestroyed()) {
+    updateWindow.webContents.send('update:progress', { percent });
+  }
+}
+
+// Останавливает VPN-туннель и фоновую службу — то же самое, что делает
+// tray "Выход" (quitApp()) — перед тем как отдать управление установщику.
+// Нужно, чтобы свежескачанный инсталлятор не наткнулся на "VPN запущен,
+// закройте вручную" и чтобы ничего не висело в Диспетчере задач/Службах.
+async function stopTunnelForInstall() {
+  try { await tunnelExec('stop'); } catch(e) { /* не был запущен — ок */ }
+  try { await tunnelExec('service-stop'); } catch(e) {
+    console.error('stopTunnelForInstall: service-stop failed:', e.message);
+  }
+}
+
+// Шаг 2 → «Да, установить». Закрывает окно обновления, гасит VPN и службу
+// полностью, очищает "висящую" версию из настроек (раз ставим — она
+// больше не pending) и передаёт управление NSIS-инсталлятору. Сам визард
+// NSIS не меняем — после этого вызова дальше показывается стандартное
+// окно установки Windows со своей финальной страницей "Запустить".
+ipcMain.handle('update:install', async () => {
   isQuitting = true;
+  if (updateWindow && !updateWindow.isDestroyed()) { updateWindow.close(); }
+  await stopTunnelForInstall();
+  try {
+    const s = loadSettings();
+    saveSettings({ ...s, updatePendingVersion: null });
+  } catch(e) {}
   setImmediate(() => autoUpdater && autoUpdater.quitAndInstall());
 });
 
-ipcMain.handle('update:later', () => {
-  if (updateWindow && !updateWindow.isDestroyed()) updateWindow.close();
+// Шаг 1 → «Обновить». Начинает реальное скачивание (autoDownload=false,
+// так что до этого клика ничего не льётся по сети). download-progress и
+// update-downloaded дальше обрабатываются в подписках ниже и форвардятся
+// в окно через sendUpdateProgress / openUpdateWindow(..., 'downloaded').
+ipcMain.handle('update:download', async () => {
+  if (!autoUpdater) return { error: 'updater unavailable' };
+  try {
+    await autoUpdater.downloadUpdate();
+    return { ok: true };
+  } catch(e) {
+    return { error: e && e.message || String(e) };
+  }
 });
+
+// «Позже» (шаг 1) или «Нет» (шаг 2) — а также чекбокс «не спрашивать»,
+// который может быть отмечен на любом из двух шагов.
+ipcMain.handle('update:skip', (event, { dontAskAgain } = {}) => {
+  if (updateWindow && !updateWindow.isDestroyed()) updateWindow.close();
+  if (dontAskAgain) {
+    const s = loadSettings();
+    saveSettings({ ...s, updateSkipPrompt: true });
+  }
+});
+
+// Настройки → кнопка «Проверить обновление». Игнорирует updateSkipPrompt —
+// это явный запрос пользователя, флаг автопроверки на него не действует.
+ipcMain.handle('update:checkManual', async () => {
+  if (!app.isPackaged || !autoUpdater) return { upToDate: true };
+  try {
+    const result = await autoUpdater.checkForUpdates();
+    if (!result || !result.updateInfo) return { upToDate: true };
+    const latest = result.updateInfo.version;
+    if (latest && latest !== app.getVersion()) {
+      await maybeShowUpdateWindow(latest);
+      return { upToDate: false, version: latest };
+    }
+    return { upToDate: true };
+  } catch(e) {
+    return { error: e && e.message || String(e) };
+  }
+});
+
 app.on('second-instance', () => showMainWindow());
 
+// Решает, какой шаг показать для найденной версии `latest`:
+//  - если это та же версия, что пользователь уже видел скачанной и отложил
+//    (settings.updatePendingVersion === latest) — тихо дозапрашиваем
+//    скачивание (мгновенно из кеша electron-updater, без сети) и открываем
+//    окно сразу на шаге 2, без промежуточного мигания шагом 1/прогрессом;
+//  - иначе — это версия, которую пользователь ещё не видел (либо вышла
+//    более новая, пока старая лежала отложенной) — показываем шаг 1.
+async function maybeShowUpdateWindow(latest) {
+  const s = loadSettings();
+  if (s.updatePendingVersion && s.updatePendingVersion === latest) {
+    try {
+      await autoUpdater.downloadUpdate();
+      // update-downloaded подписка ниже сама откроет окно на шаге 2.
+    } catch(e) {
+      // Кеш оказался не валиден (например, файл удалили вручную) —
+      // откатываемся к обычному показу шага 1.
+      openUpdateWindow(latest, 'available');
+    }
+  } else {
+    openUpdateWindow(latest, 'available');
+  }
+}
+
 app.whenReady().then(createWindow).then(() => {
+  // Re-sync autostart with the saved setting on every launch. After an
+  // app update (NSIS replaces the .exe and can wipe/relocate the Task
+  // Scheduler entry), the saved "autostart: true" setting would otherwise
+  // sit there doing nothing until the user manually flipped the toggle
+  // off and on again. Comparing against the actual current state and only
+  // touching the registration when it's out of sync also avoids needless
+  // schtasks calls (and their UAC-adjacent overhead) on every normal start.
+  try {
+    const s = loadSettings();
+    const wantAutostart = !!s.autostart;
+    const actuallyEnabled = getAutostartEnabled();
+    if (wantAutostart !== actuallyEnabled) {
+      setAutostart(wantAutostart);
+      _autostartCache = null;
+    }
+  } catch(e) {
+    console.error('autostart re-sync error:', e);
+  }
+
+  // Warm up the background tunnel service right away. The service is now
+  // persistent (created once, stays running) instead of being recreated on
+  // every connect — this call makes sure it's already up by the time the
+  // user clicks "Connect", so the very first connect of a session is fast
+  // too, not just subsequent ones. Failures here are silent on purpose:
+  // if this fails (e.g. somehow not elevated), the normal connect flow
+  // will retry the same install-and-start logic anyway.
+  tunnelExec('status').catch(() => {});
+
   // Check for updates only in packaged app — in dev there's no published
   // release to compare against, and electron-updater throws on dev_app_update.yml missing.
   if (!app.isPackaged || !autoUpdater) return;
+
+  // Пользователь поставил «не спрашивать об обновлениях» — автопроверка
+  // при старте полностью выключена. Узнать про новую версию можно только
+  // через кнопку «Проверить обновление» в настройках (она не смотрит на
+  // этот флаг — это явный запрос, а не фоновая проверка).
+  if (loadSettings().updateSkipPrompt) return;
+
+  // TEMP DIAGNOSTIC: console.error is invisible once packaged (no terminal
+  // attached), so write updater events to a plain file we can read directly
+  // — this is the only way to see what's actually happening on the user's
+  // machine instead of guessing.
+  const updateLogPath = path.join(DATA_DIR, 'update-debug.log');
+  const logUpdate = (msg) => {
+    try { fs.appendFileSync(updateLogPath, `[${new Date().toISOString()}] ${msg}\n`); } catch(e) {}
+  };
   try {
-    autoUpdater.autoDownload = true;
-    autoUpdater.autoInstallOnAppQuit = true;
-    autoUpdater.on('error', (err) => console.error('updater:', err && err.message));
+    // Ничего не скачивается само и не ставится само при выходе — весь
+    // процесс теперь требует явного клика пользователя на каждом шаге
+    // (см. update:download / update:install выше).
+    autoUpdater.autoDownload = false;
+    autoUpdater.autoInstallOnAppQuit = false;
+    logUpdate(`init: current app version = ${app.getVersion()}`);
+    autoUpdater.on('error', (err) => { console.error('updater:', err && err.message); logUpdate(`ERROR: ${err && err.stack || err}`); });
+    autoUpdater.on('checking-for-update', () => logUpdate('checking-for-update'));
+    autoUpdater.on('update-available', (info) => {
+      logUpdate(`update-available: ${JSON.stringify(info)}`);
+      maybeShowUpdateWindow(info && info.version ? info.version : '').catch(e => logUpdate(`maybeShowUpdateWindow error: ${e}`));
+    });
+    autoUpdater.on('update-not-available', (info) => logUpdate(`update-not-available: ${JSON.stringify(info)}`));
+    autoUpdater.on('download-progress', (p) => {
+      logUpdate(`download-progress: ${p.percent}%`);
+      sendUpdateProgress(p.percent);
+    });
     autoUpdater.on('update-downloaded', (info) => {
-      openUpdateWindow(info && info.version ? info.version : '');
+      logUpdate(`update-downloaded: ${JSON.stringify(info)}`);
+      const version = info && info.version ? info.version : '';
+      try {
+        const s = loadSettings();
+        saveSettings({ ...s, updatePendingVersion: version });
+      } catch(e) {}
+      openUpdateWindow(version, 'downloaded');
     });
     // Delay a bit so the UI renders first, then check.
     setTimeout(() => {
-      autoUpdater.checkForUpdatesAndNotify().catch(e => console.error('updater check:', e));
+      logUpdate('calling checkForUpdates()');
+      autoUpdater.checkForUpdates().catch(e => { console.error('updater check:', e); logUpdate(`checkForUpdates rejected: ${e && e.stack || e}`); });
     }, 5000);
   } catch(e) {
     console.error('updater init:', e);
+    logUpdate(`init throw: ${e && e.stack || e}`);
   }
 });
 app.on('window-all-closed', (e) => {
@@ -787,18 +1075,17 @@ app.on('window-all-closed', (e) => {
 });
 
 // Guarantee tunnel stops on any exit path (Alt+F4 on a non-hidden window,
-// OS shutdown, external kill). Normally quitApp() handles this, but this
-// handler is the safety net.
+// tray "Выход", external kill). System shutdown/restart is handled
+// separately above by powerMonitor.setShutdownHandler, since Windows
+// doesn't reliably wait for before-quit to finish in that case — this
+// handler covers the remaining "app is quitting but Windows itself isn't"
+// paths, going through the same stopTunnelOnExit() so both can't drift.
 let beforeQuitHandled = false;
 app.on('before-quit', (event) => {
   if (beforeQuitHandled) return;
   beforeQuitHandled = true;
   event.preventDefault();
-  (async () => {
-    try { await tunnelExec('stop'); } catch(e) {}
-    deleteConnectTime();
-    app.exit(0);
-  })();
+  stopTunnelOnExit().then(() => app.exit(0));
 });
 
 // ─── Settings window ─────────────────────────────────────
@@ -812,7 +1099,7 @@ function openSettings() {
   // Position to the left of main window with 12px gap, clamped to work area.
   const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200, width: 380, height: 560 };
   const settingsWidth = 340;
-  const settingsHeight = 600;
+  const settingsHeight = 615;
   const gap = 12;
   const display = screen.getDisplayNearestPoint({ x: mainBounds.x, y: mainBounds.y });
   const wa = display.workArea;
@@ -1165,7 +1452,7 @@ ipcMain.handle('whitelist:save', async (event, list) => {
 
   let restarted = false;
   try {
-    const st = await tunnelExec('status').catch(() => 'STOPPED');
+    const st = await tunnelStatus().catch(() => 'STOPPED');
     if (st === 'RUNNING') {
       // Notify renderer so it can show a busy state and disable the button.
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -1216,9 +1503,10 @@ function deleteGuestMode() {
   try { fs.unlinkSync(GUEST_FILE); } catch(e) {}
 }
 
-function saveConnectTime() {
+function saveConnectTime(timestampMs) {
   try {
-    fs.writeFileSync(CONNECT_TIME_FILE, Date.now().toString(), 'utf-8');
+    const t = Number.isFinite(timestampMs) ? timestampMs : Date.now();
+    fs.writeFileSync(CONNECT_TIME_FILE, t.toString(), 'utf-8');
   } catch(e) {}
 }
 
@@ -1236,6 +1524,30 @@ function deleteConnectTime() {
 
 // ─── IPC: Tunnel management ──────────────────────────────
 
+// Technical errors from the tunnel process (Go/Windows API) come back in
+// English (e.g. "SCM connect failed", "CreateTUN failed: ..."). Showing
+// that directly in the UI looks broken to a non-technical user. This maps
+// the few cases we can give useful advice for, and otherwise replaces the
+// raw text with one calm, generic message in Russian — the real text is
+// still logged to debug.log for support purposes.
+function friendlyTunnelError(message) {
+  const text = String(message || '');
+  if (/need admin|access is denied|отказано в доступе/i.test(text)) {
+    return 'Недостаточно прав. Запустите приложение от имени администратора.';
+  }
+  if (/CreateTUN|wintun/i.test(text)) {
+    return 'Не удалось создать сетевой адаптер VPN. Попробуйте перезапустить приложение или компьютер.';
+  }
+  if (/timeout|timed out/i.test(text)) {
+    return 'Подключение занимает слишком много времени. Проверьте интернет-соединение и попробуйте снова.';
+  }
+  if (/parse failed/i.test(text)) {
+    return 'Файл конфигурации повреждён. Загрузите .conf файл заново.';
+  }
+  console.error('tunnel error (raw):', text);
+  return 'Не удалось подключиться. Попробуйте ещё раз или перезапустите приложение.';
+}
+
 function tunnelExec(command, arg) {
   return new Promise((resolve, reject) => {
     const args = arg ? [command, arg] : [command];
@@ -1244,6 +1556,104 @@ function tunnelExec(command, arg) {
       else resolve(stdout.trim());
     });
   });
+}
+
+// kitoftor-tunnel's Windows service keeps a small control channel open on
+// 127.0.0.1:47291 (see kitoftor-tunnel/main.go, controlAddr). The CLI's own
+// "status" command just opens a TCP connection to that same port, sends
+// "STATUS <base64>\n" and prints back whatever it gets ("RUNNING <ts>" or
+// "STOPPED").
+//
+// The renderer polls vpn:status every 3s (ui/main.html, pollVPN) to keep the
+// connect/disconnect button and the tray icon in sync. Previously every one
+// of those polls went through tunnelExec('status'), i.e. spawning a brand
+// new kitoftor-tunnel.exe process just to make that same TCP call — visible
+// on Windows as a recurring "app is busy" cursor every few seconds even
+// while sitting on the desktop with the VPN window minimized. Talking to
+// the control port directly from Node (same protocol, no extra process)
+// removes that spawn entirely. Falls back to the old execFile path only if
+// the raw socket call fails (e.g. for some reason the port handshake
+// changes) so behaviour stays identical on the error path.
+const CONTROL_HOST = '127.0.0.1';
+const CONTROL_PORT = 47291;
+
+function tunnelStatusDirect(timeoutMs = 2500) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ host: CONTROL_HOST, port: CONTROL_PORT });
+    let buf = '';
+    let settled = false;
+
+    const finish = (fn, val) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      fn(val);
+    };
+
+    socket.setTimeout(timeoutMs);
+    socket.on('timeout', () => finish(reject, new Error('timeout')));
+    socket.on('error', (e) => finish(reject, e));
+
+    socket.on('connect', () => {
+      // Empty body, same as the CLI: base64("") === "".
+      socket.write('STATUS \n');
+    });
+
+    socket.on('data', (chunk) => {
+      buf += chunk.toString('utf-8');
+      if (buf.includes('\n')) {
+        const line = buf.split('\n')[0].trim();
+        finish(resolve, parseStatusLine(line));
+      }
+    });
+
+    socket.on('end', () => {
+      // Service closes the connection right after writing the reply; if we
+      // got a full line in 'data' we've already resolved above, this is
+      // just the no-trailing-newline edge case.
+      if (!settled) finish(resolve, parseStatusLine(buf.trim()));
+    });
+  });
+}
+
+// Parses the control channel's "RUNNING <unix_seconds>" / "STOPPED" reply.
+// The timestamp here is the Go service's own connectStart (kitoftor-tunnel/
+// main.go, tunnelState.connectStart) — i.e. ground truth for when the
+// *actual* tunnel came up, independent of anything Electron has cached
+// locally. Returning it lets callers resync connect_time.dat against it
+// instead of trusting a local file that can go stale (e.g. if the app
+// didn't get to clear it before a shutdown — see stopTunnelOnExit).
+function parseStatusLine(line) {
+  if (line.startsWith('RUNNING')) {
+    const parts = line.split(/\s+/);
+    const sec = parts.length > 1 ? parseInt(parts[1], 10) : NaN;
+    return { state: 'RUNNING', connectStartMs: Number.isFinite(sec) ? sec * 1000 : null };
+  }
+  return { state: 'STOPPED', connectStartMs: null };
+}
+
+// Same contract as tunnelExec('status'): resolves to 'RUNNING' or 'STOPPED',
+// never throws for "service not running" (mirrors tunnelStatus() in Go,
+// which treats an unreachable control channel as STOPPED, not an error).
+// Kept for the existing `=== 'RUNNING'` call sites; use tunnelStatusFull()
+// where the connect timestamp is also needed.
+async function tunnelStatus() {
+  return (await tunnelStatusFull()).state;
+}
+
+async function tunnelStatusFull() {
+  try {
+    return await tunnelStatusDirect();
+  } catch (e) {
+    // Control channel not reachable (service not installed/started yet) or
+    // some unexpected hiccup — fall back to the CLI exactly like before.
+    try {
+      const out = await tunnelExec('status');
+      return parseStatusLine(out.trim());
+    } catch (e2) {
+      return { state: 'STOPPED', connectStartMs: null };
+    }
+  }
 }
 
 // Extract endpoint IP from .conf content (e.g. "Endpoint = 1.2.3.4:49792" -> "1.2.3.4")
@@ -1284,7 +1694,7 @@ ipcMain.handle('vpn:connect', async () => {
     return { ok: true, result };
   } catch(e) {
     updateTrayIcon('off');
-    return { error: e.message };
+    return { error: friendlyTunnelError(e.message) };
   }
 });
 
@@ -1295,15 +1705,29 @@ ipcMain.handle('vpn:disconnect', async () => {
     updateTrayIcon('off');
     return { ok: true, result };
   } catch(e) {
-    return { error: e.message };
+    return { error: friendlyTunnelError(e.message) };
   }
 });
 
 ipcMain.handle('vpn:status', async () => {
   try {
-    const result = await tunnelExec('status');
-    const state = result === 'RUNNING' ? 'on' : 'off';
-    if (state === 'off') deleteConnectTime();
+    const full = await tunnelStatusFull();
+    const state = full.state === 'RUNNING' ? 'on' : 'off';
+    if (state === 'off') {
+      deleteConnectTime();
+    } else {
+      // Resync against the service's own connectStart on every poll
+      // (every 3s from the renderer) instead of trusting whatever's
+      // sitting in connect_time.dat. This is what makes the timer
+      // self-correct even if a previous shutdown didn't get a chance to
+      // clear the file: the service is ground truth, the file is just a
+      // local cache of it for the renderer to read without a service
+      // round-trip on every tick.
+      if (full.connectStartMs) {
+        const cached = loadConnectTime();
+        if (cached !== full.connectStartMs) saveConnectTime(full.connectStartMs);
+      }
+    }
     if (state !== vpnStateForTray) {
       // Unexpected drop — was running, now stopped
       if (vpnStateForTray === 'on' && state === 'off') {
@@ -1311,7 +1735,7 @@ ipcMain.handle('vpn:status', async () => {
       }
       updateTrayIcon(state);
     }
-    return { status: result };
+    return { status: full.state };
   } catch(e) {
     deleteConnectTime();
     if (vpnStateForTray !== 'off') {

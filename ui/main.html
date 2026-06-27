@@ -155,6 +155,7 @@
     .vpn-status.on { color: var(--accent); }
 
     .vpn-hint { font-size: 13px; color: var(--text-muted); height: 18px; }
+    .vpn-hint.vpn-hint-timer { font-size: 16px; font-weight: 600; color: var(--accent); }
 
     /* ── Import prompt ── */
     .import-prompt {
@@ -272,7 +273,6 @@
     </button>
     <div class="vpn-status off" id="vpnStatusText">Не подключено</div>
     <div class="vpn-hint" id="vpnHint">Нажмите для подключения</div>
-    <div id="sessionTimer" style="font-size:16px;font-weight:600;color:var(--accent);margin-top:2px;height:20px;visibility:hidden"></div>
     <div class="error-msg" id="error" style="display:none"></div>
   </div>
 
@@ -404,8 +404,6 @@
       if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
       if (vpnState !== 'on') {
         cachedConnectTime = null;
-        const el = document.getElementById('sessionTimer');
-        if (el) { el.style.visibility = 'hidden'; el.textContent = ''; }
         return;
       }
 
@@ -415,17 +413,14 @@
       if (!cachedConnectTime) return;
 
       const tick = () => {
-        const el = document.getElementById('sessionTimer');
-        if (!el || !cachedConnectTime) return;
+        const el = document.getElementById('vpnHint');
+        if (!el || !cachedConnectTime || vpnState !== 'on') return;
         el.textContent = formatTimer();
-        el.style.visibility = 'visible';
       };
       tick(); // show immediately, don't wait 1s
       timerInterval = setInterval(() => {
         if (vpnState !== 'on') {
           clearInterval(timerInterval); timerInterval = null;
-          const el = document.getElementById('sessionTimer');
-          if (el) { el.style.visibility = 'hidden'; el.textContent = ''; }
           return;
         }
         tick();
@@ -504,9 +499,11 @@
         : vpnState === 'connecting' ? (connectReason === 'disconnecting' ? 'Отключение...' : connectReason === 'whitelist' ? 'Применение...' : 'Подключение...')
         : 'Не подключено';
       hintEl.style.display = '';
+      hintEl.className = 'vpn-hint' + (vpnState === 'on' ? ' vpn-hint-timer' : '');
       hintEl.textContent = vpnState === 'connecting'
         ? (connectReason === 'disconnecting' ? 'Завершаем соединение' : connectReason === 'whitelist' ? 'Обновляем белый список' : 'Устанавливаем соединение')
-        : vpnState === 'off' ? 'Нажмите для подключения' : '';
+        : vpnState === 'off' ? 'Нажмите для подключения'
+        : (cachedConnectTime ? formatTimer() : '');
     }
 
     function render() {
