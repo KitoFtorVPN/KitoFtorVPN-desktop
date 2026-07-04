@@ -86,4 +86,9 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.on('vpn:autoconnected', listener);
     return () => ipcRenderer.removeListener('vpn:autoconnected', listener);
   },
+  onConfigChanged: (cb) => {
+    const listener = (_e, p) => cb(p);
+    ipcRenderer.on('config:changed', listener);
+    return () => ipcRenderer.removeListener('config:changed', listener);
+  },
 });

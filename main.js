@@ -90,9 +90,13 @@ async function stopTunnelOnExit() {
 // ready event of the app module is emitted").
 function registerShutdownHandler() {
   if (process.platform === 'win32') {
-    powerMonitor.setShutdownHandler(async () => {
-      await stopTunnelOnExit();
-      return true; // tell Windows it's fine to continue shutting down now
+    // There is no powerMonitor.setShutdownHandler in Electron — the real
+    // API is the 'shutdown' event. Calling event.preventDefault() tells
+    // Windows to hold off, giving us time to run stopTunnelOnExit() before
+    // finally letting the app (and shutdown) proceed via app.quit().
+    powerMonitor.on('shutdown', (event) => {
+      event.preventDefault();
+      stopTunnelOnExit().then(() => app.quit());
     });
   }
 }
@@ -1399,9 +1403,43 @@ ipcMain.handle('config:import', async () => {
     if (!confText.includes('[Interface]') || !confText.includes('[Peer]')) {
       return { error: 'Неверный формат файла. Нужен .conf файл из личного кабинета.' };
     }
+
+    // If the tunnel is already up, it was started with the *old* config's
+    // contents (passed once via stdin, not re-read live) — just overwriting
+    // the file on disk wouldn't actually change what's running. Stop it
+    // first so the switch is real, then bring it back up with the new one
+    // once it's saved.
+    let wasRunning = false;
+    try {
+      const full = await tunnelStatusFull();
+      wasRunning = full.state === 'RUNNING';
+    } catch(e) {}
+    if (wasRunning) {
+      try { await tunnelExec('stop'); } catch(e) {}
+      deleteConnectTime();
+      updateTrayIcon('off');
+      notifyConfigChanged({ vpnState: 'off' });
+    }
+
     const saved = await saveConfig(confText);
     if (!saved) return { error: 'Не удалось сохранить конфигурацию.' };
     _keytarConfigCached = true;
+
+    if (wasRunning) {
+      try {
+        await connectVpn();
+        notifyConfigChanged({ hasConfig: true, vpnState: 'on' });
+        return { ok: true, reconnected: true };
+      } catch(e) {
+        updateTrayIcon('off');
+        notifyConfigChanged({ hasConfig: true, vpnState: 'off' });
+        // Config itself saved fine — just tell the user the automatic
+        // reconnect with it didn't work, they can hit connect manually.
+        return { ok: true, reconnected: false, reconnectError: friendlyTunnelError(e.message) };
+      }
+    }
+
+    notifyConfigChanged({ hasConfig: true });
     return { ok: true };
   } catch(e) {
     return { error: 'Не удалось прочитать файл.' };
@@ -1420,7 +1458,9 @@ ipcMain.handle('config:exists', async () => {
 ipcMain.handle('config:delete', async () => {
   try { await tunnelExec('stop'); } catch(e) {}
   deleteConfigFile();
+  deleteConnectTime();
   updateTrayIcon('off');
+  notifyConfigChanged({ hasConfig: false, vpnState: 'off' });
   return { ok: true };
 });
 
@@ -1565,6 +1605,9 @@ function deleteConnectTime() {
 // still logged to debug.log for support purposes.
 function friendlyTunnelError(message) {
   const text = String(message || '');
+  if (/Конфигурация повреждена или не найдена/.test(text)) {
+    return text;
+  }
   if (/need admin|access is denied|отказано в доступе/i.test(text)) {
     return 'Недостаточно прав. Запустите приложение от имени администратора.';
   }
@@ -1705,25 +1748,47 @@ function tunnelStartStdin(configContent) {
   });
 }
 
+// Shared by vpn:connect and by config:import's auto-reconnect (when the
+// user swaps their config while already connected, we tear down and bring
+// the tunnel back up with the *new* config instead of leaving the old one
+// running under the old one).
+async function connectVpn() {
+  let conf = await loadConfig();
+  if (!conf) throw new Error('Конфигурация повреждена или не найдена. Загрузите .conf файл заново.');
+
+  // Apply whitelist (split tunneling) if enabled.
+  const settings = loadSettings();
+  if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
+    try {
+      conf = await applyWhitelistToConfig(conf, settings.whitelist);
+    } catch(e) {
+      console.error('whitelist apply error:', e);
+    }
+  }
+
+  updateTrayIcon('connecting');
+  const result = await tunnelStartStdin(conf);
+  saveConnectTime();
+  updateTrayIcon('on');
+  return result;
+}
+
+// Settings/whitelist windows can change config/VPN state behind the main
+// window's back — it has its own cached hasConf/vpnState that only get
+// re-read at startup otherwise. This pushes a refresh so it updates live
+// instead of requiring an app restart to notice.
+function notifyConfigChanged(payload) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('config:changed', payload);
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('config:changed', payload);
+  }
+}
+
 ipcMain.handle('vpn:connect', async () => {
   try {
-    let conf = await loadConfig();
-    if (!conf) return { error: 'Конфигурация повреждена или не найдена. Загрузите .conf файл заново.' };
-
-    // Apply whitelist (split tunneling) if enabled.
-    const settings = loadSettings();
-    if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
-      try {
-        conf = await applyWhitelistToConfig(conf, settings.whitelist);
-      } catch(e) {
-        console.error('whitelist apply error:', e);
-      }
-    }
-
-    updateTrayIcon('connecting');
-    const result = await tunnelStartStdin(conf);
-    saveConnectTime();
-    updateTrayIcon('on');
+    const result = await connectVpn();
     return { ok: true, result };
   } catch(e) {
     updateTrayIcon('off');
