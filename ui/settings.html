@@ -286,6 +286,14 @@
       const hasConf = await api.configExists();
       document.getElementById('changeConfBtn').style.display = hasConf ? '' : 'none';
       document.getElementById('deleteConfBtn').style.display = hasConf ? '' : 'none';
+
+      if (api.onConfigChanged) {
+        api.onConfigChanged((p) => {
+          if (!p || typeof p.hasConfig !== 'boolean') return;
+          document.getElementById('changeConfBtn').style.display = p.hasConfig ? '' : 'none';
+          document.getElementById('deleteConfBtn').style.display = p.hasConfig ? '' : 'none';
+        });
+      }
       const s = await api.getSettings();
       document.getElementById('autostart').checked = s.autostart || false;
       document.getElementById('autoconnect').checked = s.autoconnect || false;

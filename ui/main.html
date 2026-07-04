@@ -319,6 +319,17 @@
         if (p && p.error) showError(p.error);
       });
     }
+    // Config changed/deleted from the settings window — refresh right away
+    // instead of only picking it up on next app restart.
+    if (api.onConfigChanged) {
+      api.onConfigChanged((p) => {
+        if (p && typeof p.hasConfig === 'boolean') hasConf = p.hasConfig;
+        if (p && p.vpnState) vpnState = p.vpnState;
+        connectReason = null;
+        render();
+        startSessionTimer();
+      });
+    }
 
     let isGuestMode = false;
 
