@@ -1,5 +1,6 @@
 ; installer.nsh — custom NSIS hooks for KitoFtorVPN
-; Runs during uninstall to clean up the autostart scheduled task.
+; Runs during install/uninstall to clean up the service, the autostart
+; scheduled task, and runtime files the installed-file list does not cover.
 
 !include "LogicLib.nsh"
 
@@ -21,9 +22,31 @@ Var kftv_resolvedTarget
   !define IID_IShellLink ${IID_IShellLinkA}
 !endif
 
+; customUnInstall previously removed only the autostart scheduled task, which
+; left the actual Windows service behind: registered, StartAutomatic, and
+; pointing at an exe the uninstaller had just deleted. Windows then retried
+; starting it on every boot and logged a failure each time, forever. Worse,
+; if the service happened to still be running with a tunnel up, its routes
+; stayed in the routing table after the VPN was "uninstalled".
+;
+; Order matters: stop before delete, or "sc delete" only marks the service
+; for deletion and it lingers until the next reboot. The Sleep gives the SCM
+; a moment to finish the stop — the service's own Execute loop tears down any
+; active tunnel and its routes on svc.Stop before it exits.
+;
+; debug.log is written by kitoftor-tunnel.exe at runtime, so it was never
+; part of the installed file list and the uninstaller didn't know to remove
+; it. Same for its rotated copy.
 !macro customUnInstall
   nsExec::ExecToLog 'schtasks /Delete /TN "KitoFtorVPNAutostart" /F'
   Pop $0
+  nsExec::ExecToLog 'sc stop KitoFtorVPNTunnel'
+  Pop $0
+  Sleep 3000
+  nsExec::ExecToLog 'sc delete KitoFtorVPNTunnel'
+  Pop $0
+  Delete "$INSTDIR\resources\bin\debug.log"
+  Delete "$INSTDIR\resources\bin\debug.log.old"
 !macroend
 
 ; ───────────────────────────────────────────────────────────

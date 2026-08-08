@@ -1,25 +1,84 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage, screen, Notification, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, dialog, Tray, Menu, nativeImage, screen, Notification, safeStorage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const https = require('https');
-const { execFile, spawn } = require('child_process');
+const { execFile, execFileSync, spawn } = require('child_process');
 const net = require('net');
 const dns = require('dns').promises;
+const crypto = require('crypto');
 // electron-updater is a runtime dep of the packaged app. In dev (npm start)
 // the module may not be installed yet — fail soft so dev still works.
 let autoUpdater = null;
 try { autoUpdater = require('electron-updater').autoUpdater; } catch(e) {}
 
-// keytar — native OS credential store (Windows Credential Manager).
-// Eliminates the need to spawn tunnel.exe for DPAPI on every startup.
-// Falls back to legacy DPAPI-via-tunnel if not available.
+// Secret storage.
+//
+// Secrets (the session token and the WireGuard config, which contains the
+// private key) are encrypted with Electron's built-in safeStorage, which on
+// Windows is DPAPI scoped to the current user account — the same protection
+// keytar's Credential Manager entries had.
+//
+// This replaces keytar, which was a native module: it had to be rebuilt for
+// every Electron ABI, and the `try { require } catch {}` around it meant a
+// failed rebuild would degrade to plaintext-on-disk *silently*. It also
+// replaces the old dpapi-encrypt/-decrypt round trip through
+// kitoftor-tunnel.exe, which spawned a process for every read and write.
+// Microsoft archived keytar in 2023; there will be no further releases.
+//
+// keytar is still loaded here, but only to migrate existing users' secrets
+// out of Credential Manager on first launch after the update — without it
+// everyone would be silently logged out. It can be dropped from
+// package.json one release from now.
 let keytar = null;
 try { keytar = require('keytar'); } catch(e) {}
 
 const KEYTAR_SERVICE = 'fun.kitoftorvpn.desktop';
 const KEYTAR_TOKEN_ACCOUNT = 'session_token';
 const KEYTAR_CONFIG_ACCOUNT = 'wireguard_config';
+
+// Reading and writing a safeStorage-encrypted file. Values are stored
+// base64-encoded so the files stay plain text, same as before.
+function secretWrite(file, plaintext) {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('safeStorage unavailable');
+  }
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const enc = safeStorage.encryptString(String(plaintext));
+  fs.writeFileSync(file, enc.toString('base64'), 'utf-8');
+}
+
+function secretRead(file) {
+  if (!fs.existsSync(file)) return null;
+  const raw = fs.readFileSync(file, 'utf-8').trim();
+  if (!raw) return null;
+  try {
+    return safeStorage.decryptString(Buffer.from(raw, 'base64')) || null;
+  } catch(e) {
+    // Written by an older version through the tunnel's DPAPI helper, or
+    // corrupted. The caller falls back to the legacy path.
+    return null;
+  }
+}
+
+function secretDelete(file) {
+  try { fs.unlinkSync(file); } catch(e) {}
+}
+
+// One-shot migration of a keytar entry into a safeStorage file.
+async function migrateFromKeytar(account, file) {
+  if (!keytar) return null;
+  try {
+    const val = await keytar.getPassword(KEYTAR_SERVICE, account);
+    if (!val) return null;
+    secretWrite(file, val);
+    keytar.deletePassword(KEYTAR_SERVICE, account).catch(() => {});
+    return val;
+  } catch(e) {
+    console.error('migrateFromKeytar error:', e);
+    return null;
+  }
+}
 
 const API_BASE = 'https://my.kitoftorvpn.fun';
 const TUNNEL_EXE = app.isPackaged
@@ -45,34 +104,40 @@ app.setAppUserModelId('fun.kitoftorvpn.desktop');
 
 // ─── Guaranteed teardown on system shutdown/restart ──────
 //
-// before-quit (further down) is NOT enough on its own: Windows only gives
-// a normal foreground app a few seconds to react to WM_QUERYENDSESSION
-// before it either shows "this app is preventing shutdown" or just kills
-// the process outright. If tunnelExec hadn't finished yet at that point,
-// the tunnel and its routes were left running — which is the whole bug
-// this fixes.
+// Windows-only app, so there is exactly one thing to get right here.
 //
-// powerMonitor.setShutdownHandler (Windows-only) is different: returning
-// a Promise from it actually makes Windows wait for that promise before
-// continuing the shutdown, the same mechanism a real "block shutdown"
-// app uses. Registering it this early (before whenReady) matters per
-// Electron's own docs — it has to be in place before the shutdown sequence
-// can start, not added later once the window exists.
+// before-quit (further down) is not enough on its own: when Windows itself
+// is shutting down, the app doesn't get the usual leisurely quit sequence
+// — it gets a short grace period and is then killed. If teardown hadn't
+// finished by then, the tunnel and its routes were left running, which is
+// the whole bug this fixes.
 //
-// stopTunnelOnExit() is shared with before-quit further down so both
-// paths (user clicks "Выход" vs. Windows shutting the whole machine down)
-// go through the exact same teardown and can't drift apart again.
+// The one notification Windows gives us is app's 'session-end'. It cannot
+// be cancelled or delayed, and — crucially — nothing async started inside
+// it will ever be awaited: Windows tears the process down without
+// servicing the event loop again. So that path has to be synchronous.
+//
+// (For the record, since this cost us a startup crash once: neither
+// powerMonitor.setShutdownHandler() nor the powerMonitor 'shutdown' event
+// exists on Windows — both are macOS/Linux-only. setShutdownHandler is
+// literally undefined here, hence the old "is not a function" on launch.
+// Don't reintroduce either of them.)
+//
+// Two teardown paths, one shared guard flag so they can't both run:
+//   • stopTunnelOnExit()     — async, for normal quits (tray "Выход",
+//                              Alt+F4), where we can take our time.
+//   • stopTunnelOnExitSync() — blocking, for session-end.
+// Both end in the same two tunnel commands so they can't drift apart.
 let tunnelStopped = false;
+let sessionEnding = false;
+
 async function stopTunnelOnExit() {
   if (tunnelStopped) return;
   tunnelStopped = true;
-  // Hard cap: Windows' own patience for setShutdownHandler is finite too
-  // (a few seconds in practice) — if tunnelExec is somehow stuck (killed
-  // antivirus scan on the exe, disk thrashing, whatever), we must not hang
-  // the whole machine's shutdown forever waiting on it. Better to return
-  // and let the next boot's stale-marker cleanup (kitoftor-tunnel service,
-  // see hadUncleanPriorRun) finish the job than to block a shutdown
-  // indefinitely.
+  // Hard cap: if the tunnel exe is somehow stuck (antivirus scanning it,
+  // disk thrashing, whatever) we must not hang forever waiting on it.
+  // Better to bail and let the next boot's stale-marker cleanup
+  // (kitoftor-tunnel service, see hadUncleanPriorRun) finish the job.
   await Promise.race([
     (async () => {
       try { await tunnelExec('stop'); } catch (e) {}
@@ -83,22 +148,28 @@ async function stopTunnelOnExit() {
   deleteConnectTime();
 }
 
-// NOTE: registering this inside app.whenReady() (further down) instead of
-// here at top-level — some Electron builds throw/misbehave ("...is not a
-// function") if powerMonitor is touched before the app 'ready' event, per
-// Electron's own docs ("you cannot require or use this module until the
-// ready event of the app module is emitted").
+// Blocking twin of the above, for 'session-end' only. execFileSync holds
+// the main thread until the tunnel is actually down — the only way to
+// guarantee teardown on a path where the event loop won't run again.
+// Same 4s-per-command cap, same reasoning: Windows' patience is finite,
+// and a hung shutdown is worse than a stale marker.
+function stopTunnelOnExitSync() {
+  if (tunnelStopped) return;
+  tunnelStopped = true;
+  const opts = { timeout: 4000, windowsHide: true, stdio: 'ignore' };
+  try { execFileSync(TUNNEL_EXE, ['stop'], opts); } catch (e) {}
+  try { execFileSync(TUNNEL_EXE, ['service-stop'], opts); } catch (e) {}
+  try { deleteConnectTime(); } catch (e) {}
+}
+
+// Called from app.whenReady() further down rather than at module
+// top-level, so the app is fully initialised before we attach to it.
 function registerShutdownHandler() {
-  if (process.platform === 'win32') {
-    // There is no powerMonitor.setShutdownHandler in Electron — the real
-    // API is the 'shutdown' event. Calling event.preventDefault() tells
-    // Windows to hold off, giving us time to run stopTunnelOnExit() before
-    // finally letting the app (and shutdown) proceed via app.quit().
-    powerMonitor.on('shutdown', (event) => {
-      event.preventDefault();
-      stopTunnelOnExit().then(() => app.quit());
-    });
-  }
+  app.on('session-end', () => {
+    sessionEnding = true;
+    stopTunnelOnExitSync();
+    app.exit(0);
+  });
 }
 
 // Prevent multiple instances
@@ -441,21 +512,8 @@ function getAutostartEnabled() {
 
 // ─── DPAPI via Go helper ─────────────────────────────────
 
-function dpapiEncrypt(plaintext) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(TUNNEL_EXE, ['dpapi-encrypt']);
-    let out = '', err = '';
-    child.stdout.on('data', (d) => out += d);
-    child.stderr.on('data', (d) => err += d);
-    child.on('close', (code) => {
-      if (code === 0) resolve(out.trim());
-      else reject(new Error(err || 'dpapi-encrypt failed'));
-    });
-    child.stdin.write(plaintext);
-    child.stdin.end();
-  });
-}
-
+// Only dpapiDecrypt remains: it is needed to read secrets written by
+// versions before safeStorage, and nothing writes in that format anymore.
 function dpapiDecrypt(base64data) {
   return new Promise((resolve, reject) => {
     const child = spawn(TUNNEL_EXE, ['dpapi-decrypt']);
@@ -475,15 +533,7 @@ function dpapiDecrypt(base64data) {
 
 async function saveToken(token) {
   try {
-    if (keytar) {
-      await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT, token);
-      // Remove legacy file if it exists
-      try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
-    } else {
-      const encrypted = await dpapiEncrypt(token);
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(TOKEN_FILE, encrypted, 'utf-8');
-    }
+    secretWrite(TOKEN_FILE, token);
   } catch(e) {
     console.error('saveToken error:', e);
   }
@@ -491,29 +541,27 @@ async function saveToken(token) {
 
 async function loadToken() {
   try {
-    if (keytar) {
-      // Try keytar first
-      const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT);
-      if (val) return val;
-      // Migrate from legacy DPAPI file
-      if (fs.existsSync(TOKEN_FILE)) {
-        const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
-        if (encrypted) {
-          const plain = await dpapiDecrypt(encrypted);
-          if (plain) {
-            await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT, plain);
-            try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
-            return plain;
-          }
+    // Current format.
+    const val = secretRead(TOKEN_FILE);
+    if (val) return val;
+
+    // Legacy 1: keytar / Credential Manager.
+    const migrated = await migrateFromKeytar(KEYTAR_TOKEN_ACCOUNT, TOKEN_FILE);
+    if (migrated) return migrated;
+
+    // Legacy 2: DPAPI blob written by the tunnel helper. Re-encrypt with
+    // safeStorage so this path is only ever taken once.
+    if (fs.existsSync(TOKEN_FILE)) {
+      const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
+      if (encrypted) {
+        const plain = await dpapiDecrypt(encrypted).catch(() => null);
+        if (plain) {
+          try { secretWrite(TOKEN_FILE, plain); } catch(e) {}
+          return plain;
         }
       }
-      return null;
-    } else {
-      if (!fs.existsSync(TOKEN_FILE)) return null;
-      const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
-      if (!encrypted) return null;
-      return (await dpapiDecrypt(encrypted)) || null;
     }
+    return null;
   } catch(e) {
     console.error('loadToken error:', e);
     return null;
@@ -524,21 +572,14 @@ function deleteToken() {
   if (keytar) {
     keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT).catch(() => {});
   }
-  try { fs.unlinkSync(TOKEN_FILE); } catch(e) {}
+  secretDelete(TOKEN_FILE);
 }
 
 // ─── Config storage (DPAPI) ──────────────────────────────
 
 async function saveConfig(confText) {
   try {
-    if (keytar) {
-      await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT, confText);
-      try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
-    } else {
-      const encrypted = await dpapiEncrypt(confText);
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-      fs.writeFileSync(CONFIG_FILE, encrypted, 'utf-8');
-    }
+    secretWrite(CONFIG_FILE, confText);
     return true;
   } catch(e) {
     console.error('saveConfig error:', e);
@@ -548,52 +589,44 @@ async function saveConfig(confText) {
 
 async function loadConfig() {
   try {
-    if (keytar) {
-      const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT);
-      if (val) return val;
-      // Migrate from legacy DPAPI file
-      if (fs.existsSync(CONFIG_FILE)) {
-        const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
-        if (encrypted) {
-          const plain = await dpapiDecrypt(encrypted);
-          if (plain) {
-            await keytar.setPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT, plain);
-            try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
-            return plain;
-          }
+    const val = secretRead(CONFIG_FILE);
+    if (val) return val;
+
+    // Legacy 1: keytar / Credential Manager.
+    const migrated = await migrateFromKeytar(KEYTAR_CONFIG_ACCOUNT, CONFIG_FILE);
+    if (migrated) return migrated;
+
+    // Legacy 2: DPAPI blob written by the tunnel helper.
+    if (fs.existsSync(CONFIG_FILE)) {
+      const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
+      if (encrypted) {
+        const plain = await dpapiDecrypt(encrypted).catch(() => null);
+        if (plain) {
+          try { secretWrite(CONFIG_FILE, plain); } catch(e) {}
+          return plain;
         }
       }
-      return null;
-    } else {
-      if (!fs.existsSync(CONFIG_FILE)) return null;
-      const encrypted = fs.readFileSync(CONFIG_FILE, 'utf-8').trim();
-      if (!encrypted) return null;
-      return (await dpapiDecrypt(encrypted)) || null;
     }
+    return null;
   } catch(e) {
     console.error('loadConfig error:', e);
     return null;
   }
 }
 
+// Now that the config lives in a file again rather than in Credential
+// Manager, "is there a config?" is a plain file check — no async call, no
+// _keytarConfigCached flag that four different places had to remember to
+// keep in sync.
 function hasConfig() {
-  if (keytar) {
-    // Can't check synchronously — caller must use loadConfig() !== null.
-    // For the sync check we fall back to file existence as a hint.
-    // The real check happens in config:exists IPC (made async below).
-    return fs.existsSync(CONFIG_FILE) || _keytarConfigCached;
-  }
-  return fs.existsSync(CONFIG_FILE);
+  try { return fs.existsSync(CONFIG_FILE); } catch(e) { return false; }
 }
-
-let _keytarConfigCached = false; // set after first successful loadConfig()
 
 function deleteConfigFile() {
   if (keytar) {
     keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT).catch(() => {});
-    _keytarConfigCached = false;
   }
-  try { fs.unlinkSync(CONFIG_FILE); } catch(e) {}
+  secretDelete(CONFIG_FILE);
 }
 
 // ─── Tray ────────────────────────────────────────────────
@@ -791,14 +824,9 @@ async function createWindow() {
 
   const settings = loadSettings();
 
-  // Auto-connect if setting enabled.
-  // NOTE: we deliberately do NOT use the synchronous hasConfig() helper here.
-  // When configs are stored via keytar (the normal path), hasConfig() relies
-  // on _keytarConfigCached, which is only warmed up after the renderer calls
-  // config:exists — i.e. *after* this point on a fresh start. That made
-  // autoconnect silently never fire even with a real saved config and both
-  // toggles correctly enabled. loadConfig() itself awaits keytar directly,
-  // so we check the actual config up front instead.
+  // Auto-connect if setting enabled. We load the config for real rather
+  // than checking hasConfig(), because we need its contents a few lines
+  // down anyway.
   if (settings.autoconnect && (cachedToken || isGuest)) {
     // Notify renderer as soon as the window is ready so it shows "Подключение..."
     // immediately — before the tunnel actually starts.
@@ -827,7 +855,6 @@ async function createWindow() {
 
         let conf = await loadConfig();
         if (conf) {
-          _keytarConfigCached = true; // we just confirmed a config exists — keep hasConfig() in sync
           if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
             try { conf = await applyWhitelistToConfig(conf, settings.whitelist); } catch(e) {}
           }
@@ -1113,14 +1140,19 @@ app.on('window-all-closed', (e) => {
 
 // Guarantee tunnel stops on any exit path (Alt+F4 on a non-hidden window,
 // tray "Выход", external kill). System shutdown/restart is handled
-// separately above by powerMonitor.setShutdownHandler, since Windows
-// doesn't reliably wait for before-quit to finish in that case — this
-// handler covers the remaining "app is quitting but Windows itself isn't"
-// paths, going through the same stopTunnelOnExit() so both can't drift.
+// separately by registerShutdownHandler() above (session-end on Windows,
+// setShutdownHandler on macOS/Linux), since Windows doesn't reliably wait
+// for before-quit to finish in that case — this handler covers the
+// remaining "app is quitting but Windows itself isn't" paths, going
+// through the same stopTunnelOnExit() so both can't drift.
 let beforeQuitHandled = false;
 app.on('before-quit', (event) => {
   if (beforeQuitHandled) return;
   beforeQuitHandled = true;
+  // During a Windows session-end the teardown already ran synchronously in
+  // the session-end handler. Calling preventDefault() here would only stall
+  // a quit Windows is not going to wait for anyway.
+  if (sessionEnding) return;
   event.preventDefault();
   stopTunnelOnExit().then(() => app.exit(0));
 });
@@ -1231,15 +1263,80 @@ function findFreePort() {
   });
 }
 
+// The callback server used to accept /callback?token=... from anyone who
+// could reach the port. A cross-origin GET from any web page the user has
+// open needs no preflight, so a malicious site could scan localhost ports
+// and plant *its* session token in the app — after which the user is
+// silently working under the attacker's account and config.
+//
+// Three things close that: a random state that the site cannot know,
+// generated here and echoed back by our own backend; a Sec-Fetch-Site
+// check, which browsers set on cross-site requests and cannot be forged by
+// page script; and a lifetime cap, so the server isn't left listening
+// forever when a login is abandoned halfway.
+let authState = null;
+let authTimer = null;
+
+function closeAuthServer() {
+  if (authTimer) { clearTimeout(authTimer); authTimer = null; }
+  if (authServer) { authServer.close(); authServer = null; }
+  authState = null;
+}
+
 async function startAuthServer() {
   if (authServer) return authPort;
   authPort = await findFreePort();
+  authState = crypto.randomBytes(32).toString('hex');
+
+  if (authTimer) clearTimeout(authTimer);
+  authTimer = setTimeout(() => { closeAuthServer(); }, 5 * 60 * 1000);
 
   return new Promise((resolve) => {
     authServer = http.createServer(async (req, res) => {
       const url = new URL(req.url, `http://localhost:${authPort}`);
       if (url.pathname === '/callback') {
+        // Browsers set these themselves and page script cannot forge them.
+        //
+        // Checking Sec-Fetch-Site for "not cross-site" was wrong: the real
+        // login is a redirect from my.kitoftorvpn.fun to localhost, which IS
+        // cross-site, so the legitimate flow got a 403.
+        //
+        // What actually separates a login from an attack is the *kind* of
+        // request. A real callback is a top-level navigation — the browser
+        // going to an address. An attack from another site would be a
+        // background fetch/XHR/image load, which carries mode=cors|no-cors
+        // and dest=empty|image, never navigate/document.
+        //
+        // The primary defence remains the state parameter below; this check
+        // just removes the easiest class of attempt.
+        const mode = req.headers['sec-fetch-mode'];
+        const dest = req.headers['sec-fetch-dest'];
+        if ((mode && mode !== 'navigate') || (dest && dest !== 'document')) {
+          console.error('auth callback: rejected non-navigation request', mode, dest);
+          res.writeHead(403);
+          res.end('Forbidden');
+          return;
+        }
         const token = url.searchParams.get('token');
+        const state = url.searchParams.get('state');
+        if (!authState || state !== authState) {
+          // Reached either by a forged callback (the point of the check) or
+          // because the backend didn't pass ?state= through to the redirect.
+          // The message names the second case explicitly: it is the one a
+          // real user can hit, and "Invalid state" alone would send them
+          // hunting in the wrong place.
+          console.error('auth callback: state mismatch (backend must echo the state parameter back)');
+          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(`
+            <html><body style="background:#0b1120;color:#f1f5f9;font-family:-apple-system,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
+              <div style="text-align:center;max-width:420px">
+                <h2 style="color:#ef4444;font-size:20px;margin-bottom:8px">Не удалось завершить вход</h2>
+                <p style="color:#94a3b8;font-size:14px">Запрос не прошёл проверку безопасности. Закройте эту вкладку и попробуйте войти заново.</p>
+              </div>
+            </body></html>
+          `);
+          return;
+        }
         if (token) {
           cachedToken = token;
           await saveToken(token);
@@ -1259,9 +1356,7 @@ async function startAuthServer() {
             mainWindow.show();
             mainWindow.focus();
           }
-          setTimeout(() => {
-            if (authServer) { authServer.close(); authServer = null; }
-          }, 2000);
+          setTimeout(() => { closeAuthServer(); }, 2000);
         } else {
           res.writeHead(400);
           res.end('Missing token');
@@ -1281,25 +1376,25 @@ ipcMain.handle('app:getVersion', () => app.getVersion());
 
 ipcMain.handle('auth:login', async () => {
   const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/login?desktop=1&port=${port}`);
+  shell.openExternal(`${API_BASE}/login?desktop=1&port=${port}&state=${authState}`);
   return { ok: true };
 });
 
 ipcMain.handle('auth:register', async () => {
   const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/register?desktop=1&port=${port}`);
+  shell.openExternal(`${API_BASE}/register?desktop=1&port=${port}&state=${authState}`);
   return { ok: true };
 });
 
 ipcMain.handle('auth:google', async () => {
   const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/auth/google?desktop=1&port=${port}`);
+  shell.openExternal(`${API_BASE}/auth/google?desktop=1&port=${port}&state=${authState}`);
   return { ok: true };
 });
 
 ipcMain.handle('auth:telegram', async () => {
   const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/auth/telegram?desktop=1&port=${port}`);
+  shell.openExternal(`${API_BASE}/auth/telegram?desktop=1&port=${port}&state=${authState}`);
   return { ok: true };
 });
 
@@ -1362,11 +1457,29 @@ ipcMain.handle('auth:getToken', () => cachedToken || null);
 
 // ─── IPC: API proxy (subscription status) ────────────────
 
+// The session cookie is attached to this request, so `endpoint` must not be
+// able to change which host it goes to. String-concatenating it onto
+// API_BASE used to allow exactly that: an endpoint of "@evil.com/x" produces
+// "https://my.kitoftorvpn.fun@evil.com/x", where everything before the "@"
+// is userinfo and the real host is evil.com — handing the user's session
+// token to whoever asked. Require a plain absolute path, then verify the
+// parsed host really is ours before sending anything.
+function buildApiUrl(endpoint) {
+  if (typeof endpoint !== 'string') return null;
+  if (!endpoint.startsWith('/') || endpoint.startsWith('//')) return null;
+  if (endpoint.includes('@') || endpoint.includes('\\')) return null;
+  let u;
+  try { u = new URL(API_BASE + endpoint); } catch(e) { return null; }
+  if (u.origin !== new URL(API_BASE).origin) return null;
+  return u.toString();
+}
+
 ipcMain.handle('api:fetch', async (event, endpoint) => {
   if (!cachedToken) return { error: 'no_token' };
+  const url = buildApiUrl(endpoint);
+  if (!url) return { error: 'bad_endpoint' };
   try {
     return new Promise((resolve) => {
-      const url = `${API_BASE}${endpoint}`;
       const req = https.get(url, {
         headers: { 'Cookie': `cabinet_session=${cachedToken}` }
       }, (res) => {
@@ -1423,7 +1536,6 @@ ipcMain.handle('config:import', async () => {
 
     const saved = await saveConfig(confText);
     if (!saved) return { error: 'Не удалось сохранить конфигурацию.' };
-    _keytarConfigCached = true;
 
     if (wasRunning) {
       try {
@@ -1447,11 +1559,10 @@ ipcMain.handle('config:import', async () => {
 });
 
 ipcMain.handle('config:exists', async () => {
-  if (keytar) {
-    const val = await keytar.getPassword(KEYTAR_SERVICE, KEYTAR_CONFIG_ACCOUNT).catch(() => null);
-    _keytarConfigCached = !!val;
-    return _keytarConfigCached;
-  }
+  // A file check now — but any secret still sitting in Credential Manager
+  // has to be migrated first, or a returning user looks like they never
+  // imported a config.
+  if (!hasConfig()) await migrateFromKeytar(KEYTAR_CONFIG_ACCOUNT, CONFIG_FILE);
   return hasConfig();
 });
 
@@ -1634,28 +1745,30 @@ function tunnelExec(command, arg) {
   });
 }
 
-// kitoftor-tunnel's Windows service keeps a small control channel open on
-// 127.0.0.1:47291 (see kitoftor-tunnel/main.go, controlAddr). The CLI's own
-// "status" command just opens a TCP connection to that same port, sends
-// "STATUS <base64>\n" and prints back whatever it gets ("RUNNING <ts>" or
-// "STOPPED").
+// kitoftor-tunnel's Windows service keeps a small control channel open on a
+// named pipe (see kitoftor-tunnel/main.go, pipeName). The CLI's own "status"
+// command connects to that same pipe, sends "STATUS <base64>\n" and prints
+// back whatever it gets ("RUNNING <ts>" or "STOPPED").
+//
+// This was a loopback TCP port until the pipe replaced it — the port was
+// reachable by every process on the machine, including unprivileged ones,
+// with no authentication at all. The pipe's DACL grants access to SYSTEM and
+// Administrators only; this app qualifies because it runs elevated.
 //
 // The renderer polls vpn:status every 3s (ui/main.html, pollVPN) to keep the
 // connect/disconnect button and the tray icon in sync. Previously every one
 // of those polls went through tunnelExec('status'), i.e. spawning a brand
-// new kitoftor-tunnel.exe process just to make that same TCP call — visible
-// on Windows as a recurring "app is busy" cursor every few seconds even
-// while sitting on the desktop with the VPN window minimized. Talking to
-// the control port directly from Node (same protocol, no extra process)
+// new kitoftor-tunnel.exe process just to make that same call — visible on
+// Windows as a recurring "app is busy" cursor every few seconds even while
+// sitting on the desktop with the VPN window minimized. Talking to the
+// control channel directly from Node (same protocol, no extra process)
 // removes that spawn entirely. Falls back to the old execFile path only if
-// the raw socket call fails (e.g. for some reason the port handshake
-// changes) so behaviour stays identical on the error path.
-const CONTROL_HOST = '127.0.0.1';
-const CONTROL_PORT = 47291;
+// the direct call fails, so behaviour stays identical on the error path.
+const CONTROL_PIPE = '\\\\.\\pipe\\KitoFtorVPNTunnel';
 
 function tunnelStatusDirect(timeoutMs = 2500) {
   return new Promise((resolve, reject) => {
-    const socket = net.createConnection({ host: CONTROL_HOST, port: CONTROL_PORT });
+    const socket = net.createConnection({ path: CONTROL_PIPE });
     let buf = '';
     let settled = false;
 
@@ -1870,4 +1983,19 @@ ipcMain.handle('window:close', () => {
 
 // ─── IPC: External links ─────────────────────────────────
 
-ipcMain.handle('app:openExternal', (event, url) => { shell.openExternal(url); });
+// shell.openExternal hands the URL to whatever Windows has registered for
+// that scheme. Since this app runs elevated (requireAdministrator), an
+// unchecked URL from the renderer would let any injected script launch a
+// local protocol handler as administrator. Only http/https get through.
+ipcMain.handle('app:openExternal', (event, url) => {
+  try {
+    const u = new URL(String(url));
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') {
+      console.error('openExternal: blocked scheme', u.protocol);
+      return;
+    }
+    shell.openExternal(u.toString());
+  } catch(e) {
+    console.error('openExternal: invalid url');
+  }
+});

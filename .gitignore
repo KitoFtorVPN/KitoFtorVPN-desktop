@@ -4,3 +4,7 @@ dist/
 .DS_Store
 Thumbs.db
 wfpstate.xml
+bin/debug.log.old
+.env
+*.pem
+*.pfx

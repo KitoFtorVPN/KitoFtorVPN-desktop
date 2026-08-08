@@ -16,7 +16,7 @@
   },
   "devDependencies": {
     "electron": "^36.4.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^26.0.12"
   },
   "dependencies": {
     "electron-updater": "^6.3.9",
@@ -90,5 +90,10 @@
         "releaseType": "release"
       }
     ]
+  },
+  "allowScripts": {
+    "electron@36.9.5": true,
+    "keytar@7.9.0": true,
+    "electron-winstaller@5.4.0": true
   }
 }
