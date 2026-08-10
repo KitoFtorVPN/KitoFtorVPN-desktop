@@ -4,6 +4,12 @@ bin/*.exe
 bin/debug.log
 bin/debug.log.old
 
+# Go-хелпер собирается прямо в своей папке, а его вывод — тот же бинарник,
+# что уже лежит в bin/. Вторая копия в репозитории не нужна.
+kitoftor-tunnel/*.exe
+kitoftor-tunnel/debug.log
+kitoftor-tunnel/debug.log.old
+
 # Diagnostic dumps: netsh wfp show state output contains machine SIDs,
 # usernames, PIDs and the full firewall filter table of whoever ran it.
 wfpstate.xml

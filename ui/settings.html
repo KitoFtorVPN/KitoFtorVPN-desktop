@@ -120,6 +120,17 @@
       transform: translateX(20px);
       background: white;
     }
+    /* Visible but inert: "запускать свёрнутым" only means anything when the
+       app is being started by Windows, so it stays on screen and greys out
+       instead of disappearing when autostart is off. */
+    .toggle input:disabled + .toggle-track {
+      cursor: not-allowed;
+      opacity: 0.35;
+    }
+    .setting-row.disabled .setting-label,
+    .setting-row.disabled .setting-desc {
+      opacity: 0.4;
+    }
 
     .version {
       margin-top: auto;
@@ -203,6 +214,17 @@
       </div>
       <label class="toggle">
         <input type="checkbox" id="autoconnect" onchange="toggleAutoconnect()">
+        <span class="toggle-track"></span>
+      </label>
+    </div>
+
+    <div class="setting-row" id="startMinimizedRow">
+      <div class="setting-info">
+        <div class="setting-label">Запускать свёрнутым</div>
+        <div class="setting-desc">При автозапуске сразу в трей, без окна</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="startMinimized" onchange="toggleStartMinimized()">
         <span class="toggle-track"></span>
       </label>
     </div>
@@ -298,7 +320,9 @@
       const s = await api.getSettings();
       document.getElementById('autostart').checked = s.autostart || false;
       document.getElementById('autoconnect').checked = s.autoconnect || false;
+      document.getElementById('startMinimized').checked = s.startMinimized || false;
       document.getElementById('updateSkipPrompt').checked = s.updateSkipPrompt || false;
+      syncStartMinimizedRow();
       try {
         const v = await api.getVersion();
         document.getElementById('version').textContent = `KitoFtorVPN v${v}`;
@@ -307,8 +331,21 @@
       }
     }
 
+    // Greyed out unless autostart is on, since it has no effect on a launch
+    // the user performed themselves.
+    function syncStartMinimizedRow() {
+      const on = document.getElementById('autostart').checked;
+      document.getElementById('startMinimized').disabled = !on;
+      document.getElementById('startMinimizedRow').classList.toggle('disabled', !on);
+    }
+
     async function toggleAutostart() {
       await api.setSettings({ autostart: document.getElementById('autostart').checked });
+      syncStartMinimizedRow();
+    }
+
+    async function toggleStartMinimized() {
+      await api.setSettings({ startMinimized: document.getElementById('startMinimized').checked });
     }
 
     async function toggleAutoconnect() {

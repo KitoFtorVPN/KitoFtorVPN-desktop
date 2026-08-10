@@ -66,6 +66,11 @@ const tunnelInterfaceName = "KitoFtorVPN"
 // D:P  — protected DACL, do not inherit ACEs from anywhere
 // (A;;GA;;;SY) — GENERIC_ALL for NT AUTHORITY\SYSTEM (the service itself)
 // (A;;GA;;;BA) — GENERIC_ALL for BUILTIN\Administrators (the elevated app)
+// Number of pipe instances kept waiting for a caller. See the accept loops in
+// Execute for why this is more than one, and pipeListener.Close for why the
+// shutdown path has to know the number too.
+const acceptorCount = 4
+
 const pipeName = `\\.\pipe\KitoFtorVPNTunnel`
 const pipeSDDL = "D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
@@ -179,6 +184,7 @@ func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("Usage:")
 		fmt.Println("  kitoftor-tunnel.exe start-stdin")
+		fmt.Println("  kitoftor-tunnel.exe bypass       (IP list on stdin, one per line)")
 		fmt.Println("  kitoftor-tunnel.exe stop")
 		fmt.Println("  kitoftor-tunnel.exe service-stop")
 		fmt.Println("  kitoftor-tunnel.exe status")
@@ -205,6 +211,43 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Println("OK")
+
+	// Split tunneling. Takes a newline-separated list of IPv4 addresses (or
+	// CIDRs) on stdin and makes the service route exactly those *around* the
+	// tunnel, via the physical default gateway.
+	//
+	// This replaces the old approach, where the app carved the whitelist out
+	// of the peer's "AllowedIPs = 0.0.0.0/0" before handing the config over.
+	// That was wrong in two ways. It needed a full tunnel restart for every
+	// whitelist change (AllowedIPs is only read at device setup), and it
+	// produced hundreds of CIDRs — subtracting N blocks from 0.0.0.0/0
+	// mathematically requires ~24 blocks per exclusion — every one of which
+	// became a route. Here the tunnel keeps a plain 0.0.0.0/0 (two routes,
+	// 0.0.0.0/1 and 128.0.0.0/1) and the bypass list adds one /32 per address
+	// on top. Windows picks the most specific match, so the /32 wins over the
+	// /1 and that address goes out the physical adapter.
+	//
+	// Consequence worth knowing: this command can be sent at any time while
+	// the tunnel is up, and only the difference is applied. That's what lets
+	// the app re-resolve whitelisted domains periodically (CDN addresses
+	// rotate) without ever dropping the connection.
+	case "bypass":
+		listData, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: cannot read bypass list from stdin\n")
+			os.Exit(1)
+		}
+		reply, err := sendCommand("BYPASS", string(listData))
+		if err != nil {
+			log.Printf("bypass error: %v", err)
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		if !strings.HasPrefix(reply, "OK") {
+			fmt.Fprintf(os.Stderr, "ERROR: %s\n", reply)
+			os.Exit(1)
+		}
+		fmt.Println(reply)
 
 	case "start":
 		if len(os.Args) < 3 {
@@ -446,6 +489,60 @@ type tunnelState struct {
 	pc           *parsedConfig
 	defaultGW    string
 	connectStart time.Time
+
+	// Physical adapter that owns the real default route, captured at connect
+	// time. Bypass routes and the endpoint route are installed on it.
+	physLUID winipcfg.LUID
+	physGW   netip.Addr
+
+	// Split-tunneling: addresses currently routed around the tunnel. Kept so
+	// a BYPASS update only has to apply the difference, and so teardown can
+	// remove exactly what it added and nothing else.
+	bypassIPs map[netip.Prefix]bool
+}
+
+// ─── Status, readable without the main loop ──────────────
+//
+// Commands reach the service's Execute loop through a channel and are handled
+// one at a time. That is fine for connect/disconnect, which are rare and
+// mutually exclusive by nature — but STATUS is polled every three seconds by
+// the app, and it was queueing behind whatever else was in flight.
+//
+// Installing bypass routes is the case that broke it: with a large whitelist
+// that is hundreds of individual routing-table syscalls, and while it ran the
+// pending STATUS got no answer inside the client's timeout. The app read that
+// silence as "the tunnel is gone", turned the tray icon red and raised a "VPN
+// отключён" notification — with the tunnel up and passing traffic the whole
+// time. Three seconds later the next poll succeeded and it went green again,
+// which is the flicker.
+//
+// So status stops being a request the loop has to service: the loop *publishes*
+// it here whenever it changes, and STATUS is answered straight from this
+// variable by the goroutine that read the command. Nothing to queue behind.
+var (
+	statusMu      sync.RWMutex
+	statusRunning bool
+	statusStart   int64
+)
+
+func setTunnelStatus(running bool, start time.Time) {
+	statusMu.Lock()
+	statusRunning = running
+	if running {
+		statusStart = start.Unix()
+	} else {
+		statusStart = 0
+	}
+	statusMu.Unlock()
+}
+
+func currentTunnelStatusLine() string {
+	statusMu.RLock()
+	defer statusMu.RUnlock()
+	if statusRunning {
+		return fmt.Sprintf("RUNNING %d", statusStart)
+	}
+	return "STOPPED"
 }
 
 func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (bool, uint32) {
@@ -467,25 +564,56 @@ func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 	}
 	cmdCh := make(chan cmdResult)
 
-	// Accept loop runs in its own goroutine so the main Execute loop can
-	// still react to Windows service-control requests (Stop/Shutdown)
-	// promptly even while handling a command.
-	go func() {
-		for {
-			c, err := listener.Accept()
-			if err != nil {
-				return // listener closed -> service stopping
-			}
-			go func() {
-				cmd, body, ok := readCommand(c)
-				if !ok {
-					c.Close()
-					return
+	// Several accept loops rather than one.
+	//
+	// Each Accept() call creates a fresh pipe instance and parks on it, so the
+	// number of loops is the number of instances waiting for a client at any
+	// moment. With a single loop there is exactly one, and the moment a client
+	// takes it there are none until that loop comes back around — a caller
+	// arriving in that window is refused with ERROR_PIPE_BUSY.
+	//
+	// The Go CLI never noticed: dialPipeRaw retries on busy for two seconds.
+	// The Electron app is the one that suffered — its pipe client gives up on
+	// the first refusal and falls back to spawning kitoftor-tunnel.exe just to
+	// ask for status. Which is exactly the process-per-poll that the control
+	// channel exists to avoid, and it fed itself: every fallback spawned
+	// another client, making the next collision more likely. The log showed a
+	// status process every three seconds for a solid minute after connecting,
+	// while routes were being installed.
+	//
+	// Four waiting instances make the window vanish for any realistic number
+	// of concurrent callers (status polls, bypass updates, connect/disconnect).
+	for i := 0; i < acceptorCount; i++ {
+		go func() {
+			for {
+				c, err := listener.Accept()
+				if err != nil {
+					return // listener closed -> service stopping
 				}
-				cmdCh <- cmdResult{conn: c, cmd: cmd, body: body}
-			}()
-		}
-	}()
+				go func() {
+					cmd, body, ok := readCommand(c)
+					if !ok {
+						c.Close()
+						return
+					}
+					// Answered here rather than on the main loop — see the
+					// note above setTunnelStatus for why this must not queue.
+					if cmd == "STATUS" {
+						writeReply(c, currentTunnelStatusLine())
+						c.Close()
+						return
+					}
+					cmdCh <- cmdResult{conn: c, cmd: cmd, body: body}
+				}()
+			}
+		}()
+	}
+
+	// If a previous run was killed rather than stopped, the IPv6 block rule
+	// is still in the firewall and the machine has no working IPv6 even
+	// though no tunnel is up. Nothing has been blocked yet at this point, so
+	// removing it here is unconditionally safe.
+	unblockIPv6()
 
 	changes <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	log.Println("vpnService: RUNNING (idle, waiting for commands)")
@@ -495,7 +623,14 @@ func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 			return
 		}
 		log.Println("vpnService: tearing down active tunnel")
-		cleanupRoutes(current.pc, current.defaultGW, current.wgDev)
+		setTunnelStatus(false, time.Time{})
+		// Order matters: the bypass routes and the IPv6 block are the two
+		// things that outlive the adapter if we get this wrong, so they go
+		// first, before anything can fail and return early.
+		clearBypass(current)
+		unblockIPv6()
+		unsinkIPv6(tunnelLUIDOf(current))
+		cleanupRoutes(current.pc, current.physLUID, current.physGW, current.defaultGW, current.wgDev)
 		if current.uapi != nil {
 			current.uapi.Close()
 		}
@@ -533,11 +668,30 @@ func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 					continue
 				}
 
-				// getDefaultGateway spawns "cmd /C route print" — independent
-				// of TUN/device setup below, so run it concurrently instead
-				// of blocking on it before we even create the adapter.
-				gwCh := make(chan string, 1)
-				go func() { gwCh <- getDefaultGateway() }()
+				// Find the real way out to the internet before the tunnel
+				// adapter starts competing for that title. Done concurrently
+				// with device setup below, which doesn't depend on it.
+				//
+				// The API lookup is the one that matters (it also gives us
+				// the adapter LUID, which bypass routes need). getDefaultGateway
+				// still runs as a fallback for the endpoint route only, since
+				// it can't tell us a LUID.
+				type gwInfo struct {
+					luid winipcfg.LUID
+					gw   netip.Addr
+					str  string
+				}
+				gwCh := make(chan gwInfo, 1)
+				go func() {
+					luid, gw, ok := findDefaultRouteV4(0)
+					info := gwInfo{}
+					if ok {
+						info.luid, info.gw, info.str = luid, gw, gw.String()
+					} else {
+						info.str = getDefaultGateway()
+					}
+					gwCh <- info
+				}()
 
 				wintun, err := tun.CreateTUN(tunnelInterfaceName, 0)
 				if err != nil {
@@ -574,32 +728,50 @@ func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 					}(uapiListener)
 				}
 
-				defaultGW := <-gwCh
-				configureNetwork(pc, defaultGW, wintun)
+				gwi := <-gwCh
+				configureNetwork(pc, gwi.luid, gwi.gw, gwi.str, wintun)
+
+				// IPv4 now goes through the tunnel; without this, IPv6 would
+				// keep going around it. Two independent layers — see sinkIPv6.
+				blockIPv6()
+				sinkIPv6(winipcfg.LUID(tunnelLUID(wintun)))
 
 				current = &tunnelState{
 					dev:          dev,
 					wgDev:        wintun,
 					uapi:         uapiListener,
 					pc:           pc,
-					defaultGW:    defaultGW,
+					defaultGW:    gwi.str,
 					connectStart: time.Now(),
+					physLUID:     gwi.luid,
+					physGW:       gwi.gw,
+					bypassIPs:    make(map[netip.Prefix]bool),
 				}
+				setTunnelStatus(true, current.connectStart)
 				log.Println("vpnService: tunnel UP")
 				writeReply(res.conn, "OK")
+				res.conn.Close()
+
+			case "BYPASS":
+				// Sent right after connecting and then periodically, so the
+				// list tracks addresses that move (CDNs) without the tunnel
+				// ever going down. With no tunnel up there is nothing to
+				// bypass — everything is already direct — so this is a no-op
+				// rather than an error.
+				if current == nil {
+					writeReply(res.conn, "OK 0 0")
+					res.conn.Close()
+					continue
+				}
+				bypassStart := time.Now()
+				added, removed := applyBypass(current, parseBypassList(res.body))
+				log.Printf("BYPASS: applied in %v", time.Since(bypassStart))
+				writeReply(res.conn, fmt.Sprintf("OK %d %d", added, removed))
 				res.conn.Close()
 
 			case "DISCONNECT":
 				teardown()
 				writeReply(res.conn, "OK")
-				res.conn.Close()
-
-			case "STATUS":
-				if current != nil {
-					writeReply(res.conn, "RUNNING "+fmt.Sprintf("%d", current.connectStart.Unix()))
-				} else {
-					writeReply(res.conn, "STOPPED")
-				}
 				res.conn.Close()
 
 			default:
@@ -672,6 +844,15 @@ func readCommand(c net.Conn) (cmd string, body string, ok bool) {
 	if err != nil && line == "" {
 		return "", "", false
 	}
+	// The deadline covered the wait for the caller's line, and now it's here.
+	// Leaving it armed would mean the connection kills itself while the
+	// command is queued behind a slower one — CONNECT can hold the loop for
+	// several seconds, and a BYPASS waiting its turn would lose the socket
+	// out from under its own reply. The caller then sees a reset rather than
+	// an answer and asks again, on a fresh connection, behind the same queue.
+	// Closing is bounded on its own (see pipeConn.Close), so nothing is left
+	// hanging by dropping this.
+	c.SetDeadline(time.Time{})
 	line = strings.TrimSpace(line)
 	parts := strings.SplitN(line, " ", 2)
 	cmd = parts[0]
@@ -816,7 +997,7 @@ func stopWindowsService() error {
 //
 // DNS still goes through netsh (there are only ever 1-3 DNS entries, never
 // whitelist-sized, so it was never the bottleneck and is left as-is).
-func configureNetwork(pc *parsedConfig, defaultGW string, wgDev tun.Device) {
+func configureNetwork(pc *parsedConfig, physLUID winipcfg.LUID, physGW netip.Addr, defaultGW string, wgDev tun.Device) {
 	ip, ipNet, err := net.ParseCIDR(pc.address)
 	if err != nil {
 		log.Printf("configureNetwork: ParseCIDR error: %v", err)
@@ -838,19 +1019,44 @@ func configureNetwork(pc *parsedConfig, defaultGW string, wgDev tun.Device) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runNetsh("interface", "ip", "set", "dns", "name="+tunnelInterfaceName, "source=static", "addr="+pc.dns[0])
+			// validate=no matters here.
+			//
+			// By default netsh tries to reach the DNS server before accepting
+			// it, and at this point in the connect sequence the tunnel isn't
+			// carrying traffic yet — so the check always fails, costs its full
+			// timeout, and reports "Заданный DNS-сервер работает некорректно
+			// или не существует" into the log on every single connect. The
+			// server is fine; it just isn't reachable for the second or two
+			// before the handshake completes. Skipping the check removes both
+			// the delay and the misleading error.
+			runNetsh("interface", "ip", "set", "dns", "name="+tunnelInterfaceName, "source=static", "addr="+pc.dns[0], "register=none", "validate=no")
 			for i := 1; i < len(pc.dns); i++ {
 				idx := i
-				runNetsh("interface", "ip", "add", "dns", "name="+tunnelInterfaceName, "addr="+pc.dns[idx], fmt.Sprintf("index=%d", idx+1))
+				runNetsh("interface", "ip", "add", "dns", "name="+tunnelInterfaceName, "addr="+pc.dns[idx], fmt.Sprintf("index=%d", idx+1), "validate=no")
 			}
 		}()
 	}
 
-	if pc.endpointHost != "" && defaultGW != "" {
+	// The route that keeps the tunnel's own UDP packets out of the tunnel.
+	// Added through the routing API when we know the physical adapter (no
+	// process spawn); route.exe stays as the fallback for the case where the
+	// default-route lookup came up empty.
+	if pc.endpointHost != "" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runCmd("route", "add", pc.endpointHost+"/32", defaultGW, "metric", "1")
+			if physLUID != 0 && physGW.IsValid() {
+				if ep, perr := netip.ParseAddr(pc.endpointHost); perr == nil && ep.Is4() {
+					if err := physLUID.AddRoute(netip.PrefixFrom(ep, 32), physGW, 1); err == nil {
+						return
+					} else {
+						log.Printf("configureNetwork: endpoint AddRoute failed: %v", err)
+					}
+				}
+			}
+			if defaultGW != "" {
+				runCmd("route", "add", pc.endpointHost+"/32", defaultGW, "metric", "1")
+			}
 		}()
 	}
 
@@ -937,7 +1143,441 @@ func addAllowedIPRoutesViaRouteExe(allowedIPs []string, tunIP string, ifIndex st
 	wg.Wait()
 }
 
-func cleanupRoutes(pc *parsedConfig, defaultGW string, wgDev tun.Device) {
+// ─── Split tunneling: bypass routes ──────────────────────
+
+// findDefaultRouteV4 locates the machine's real (non-tunnel) IPv4 default
+// route and returns the adapter it lives on plus its gateway.
+//
+// This reads the routing table through the same API used to write it,
+// instead of shelling out to "route print" and scraping the columns —
+// which was both a process spawn on the connect path and dependent on the
+// output being in English.
+//
+// excludeLUID is the tunnel adapter: it must be skipped, because once the
+// tunnel is up its own routes are in this table too, and picking one of
+// those as "the way out to the internet" would send the bypassed traffic
+// straight back into the tunnel it is supposed to avoid.
+func findDefaultRouteV4(excludeLUID winipcfg.LUID) (winipcfg.LUID, netip.Addr, bool) {
+	rows, err := winipcfg.GetIPForwardTable2(windows.AF_INET)
+	if err != nil {
+		log.Printf("findDefaultRouteV4: GetIPForwardTable2 failed: %v", err)
+		return 0, netip.Addr{}, false
+	}
+	var (
+		bestLUID   winipcfg.LUID
+		bestGW     netip.Addr
+		bestMetric uint32
+		found      bool
+	)
+	for i := range rows {
+		r := &rows[i]
+		p := r.DestinationPrefix.Prefix()
+		if !p.IsValid() || p.Bits() != 0 || !p.Addr().Is4() {
+			continue
+		}
+		if r.InterfaceLUID == excludeLUID {
+			continue
+		}
+		gw := r.NextHop.Addr()
+		if !gw.IsValid() || !gw.Is4() || gw.IsUnspecified() {
+			continue
+		}
+		// Windows ranks competing default routes by route metric plus the
+		// interface metric, so compare on the same total (otherwise a
+		// disconnected-but-present adapter can look better than the live one).
+		total := r.Metric
+		if iface, ierr := r.InterfaceLUID.IPInterface(windows.AF_INET); ierr == nil {
+			total += iface.Metric
+		}
+		if !found || total < bestMetric {
+			bestLUID, bestGW, bestMetric, found = r.InterfaceLUID, gw, total, true
+		}
+	}
+	if found {
+		log.Printf("findDefaultRouteV4: gateway %s (metric %d)", bestGW, bestMetric)
+	} else {
+		log.Printf("findDefaultRouteV4: no usable IPv4 default route found")
+	}
+	return bestLUID, bestGW, found
+}
+
+// parseBypassList turns the newline-separated body of a BYPASS command into
+// prefixes. Bare addresses become /32. IPv6 is ignored: IPv6 is blocked
+// outright while the tunnel is up (see blockIPv6), so there is nothing for a
+// v6 bypass route to do.
+func parseBypassList(body string) map[netip.Prefix]bool {
+	out := make(map[netip.Prefix]bool)
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var prefix netip.Prefix
+		if strings.Contains(line, "/") {
+			p, err := netip.ParsePrefix(line)
+			if err != nil {
+				continue
+			}
+			prefix = p.Masked()
+		} else {
+			a, err := netip.ParseAddr(line)
+			if err != nil {
+				continue
+			}
+			prefix = netip.PrefixFrom(a, 32)
+		}
+		if !prefix.Addr().Is4() {
+			continue
+		}
+		out[prefix] = true
+	}
+	return out
+}
+
+// applyBypass brings the installed bypass routes in line with `want`, adding
+// and removing only what actually changed. Returns counts for the reply so
+// the app can log what happened.
+//
+// Metric 1 is deliberate but not load-bearing: Windows resolves conflicts by
+// longest prefix first, so a /32 here always beats the tunnel's /1 no matter
+// what the metrics say.
+func applyBypass(st *tunnelState, want map[netip.Prefix]bool) (added, removed int) {
+	if st == nil {
+		return 0, 0
+	}
+	if st.bypassIPs == nil {
+		st.bypassIPs = make(map[netip.Prefix]bool)
+	}
+
+	// The gateway these routes hang off can change underneath us — docking a
+	// laptop, moving from Wi-Fi to Ethernet, a DHCP lease renewal. Routes left
+	// pointing at the old one silently stop working, and the whitelisted sites
+	// would appear to go back through the VPN with nothing in the log to say
+	// why. Re-checking on every update and rebuilding on change keeps them tied
+	// to whatever the current way out actually is.
+	luid, gw, ok := findDefaultRouteV4(tunnelLUIDOf(st))
+	if !ok {
+		log.Printf("applyBypass: no default route available, skipping")
+		return 0, 0
+	}
+	if luid != st.physLUID || gw != st.physGW {
+		log.Printf("applyBypass: default route moved (%s -> %s), reinstalling bypass routes", st.physGW, gw)
+		clearBypass(st)
+		st.physLUID, st.physGW = luid, gw
+		st.bypassIPs = make(map[netip.Prefix]bool)
+	}
+	if st.physLUID == 0 || !st.physGW.IsValid() {
+		return 0, 0
+	}
+
+	// Every prefix whose routing actually changed in this pass. Collected so
+	// the established connections sitting on the old path can be broken —
+	// see resetTCPConnectionsTo for why that is necessary.
+	var changed []netip.Prefix
+
+	for prefix := range st.bypassIPs {
+		if want[prefix] {
+			continue
+		}
+		if err := st.physLUID.DeleteRoute(prefix, st.physGW); err != nil {
+			log.Printf("applyBypass: DeleteRoute(%s) failed: %v", prefix, err)
+		}
+		delete(st.bypassIPs, prefix)
+		changed = append(changed, prefix)
+		removed++
+	}
+
+	for prefix := range want {
+		if st.bypassIPs[prefix] {
+			continue
+		}
+		// Never bypass the VPN endpoint's own address — it already has a
+		// dedicated route and duplicating it here would only fight with it.
+		if st.pc != nil && st.pc.endpointHost != "" {
+			if ep, err := netip.ParseAddr(st.pc.endpointHost); err == nil && prefix.Bits() == 32 && prefix.Addr() == ep {
+				continue
+			}
+		}
+		if err := st.physLUID.AddRoute(prefix, st.physGW, 1); err != nil {
+			// ERROR_OBJECT_ALREADY_EXISTS shows up when a previous run left
+			// the route behind; treat it as installed so teardown removes it.
+			if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+				log.Printf("applyBypass: AddRoute(%s) failed: %v", prefix, err)
+				continue
+			}
+		}
+		st.bypassIPs[prefix] = true
+		changed = append(changed, prefix)
+		added++
+	}
+
+	// Logged unconditionally, including the +0 -0 case: when a whitelist edit
+	// appears not to take effect, "the update arrived and matched what was
+	// already installed" and "the update never arrived" look identical from
+	// the outside, and only one of them is a bug.
+	log.Printf("applyBypass: +%d -%d (total %d bypass routes, %d requested)",
+		added, removed, len(st.bypassIPs), len(want))
+
+	// A routing-table edit alone does not move traffic that is already
+	// flowing. Windows resolves the path once, when the socket connects, and
+	// caches it in the TCB; the connection then keeps using it for its whole
+	// life no matter what the table says afterwards. Browsers hold their
+	// sockets open for minutes on keep-alive and reuse them for the next
+	// request, so a site that was open before the whitelist edit goes on
+	// answering over the old path — which is precisely the "added the domain,
+	// saved, still shows the VPN address" report, and why reconnecting the
+	// VPN 'fixed' it: that destroys the adapter and every socket bound to it.
+	//
+	// Breaking those connections here makes the browser open new ones, which
+	// pick up the current table. Same in reverse when a domain is removed.
+	if len(changed) > 0 {
+		resetTCPConnectionsTo(changed)
+	}
+	return added, removed
+}
+
+// ─── Moving live connections onto the new path ───────────
+
+var (
+	dllIphlpapi             = syscall.NewLazyDLL("iphlpapi.dll")
+	procGetExtendedTCPTable = dllIphlpapi.NewProc("GetExtendedTcpTable")
+	procSetTCPEntry         = dllIphlpapi.NewProc("SetTcpEntry")
+)
+
+const (
+	tcpTableOwnerPIDAll = 5
+
+	mibTCPStateSynSent     = 3
+	mibTCPStateEstablished = 5
+	// Documented way to abort a connection from outside the owning process:
+	// hand SetTcpEntry the row with this state and the kernel drops the TCB.
+	// Requires administrator rights, which the service has (LocalSystem).
+	mibTCPStateDeleteTCB = 12
+)
+
+// Row layout of MIB_TCPROW_OWNER_PID (what GetExtendedTcpTable returns) and
+// MIB_TCPROW (what SetTcpEntry takes). Addresses and ports are in network
+// byte order exactly as Windows stores them, and are passed back untouched.
+type mibTCPRowOwnerPID struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32
+	RemoteAddr uint32
+	RemotePort uint32
+	OwningPID  uint32
+}
+
+type mibTCPRow struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32
+	RemoteAddr uint32
+	RemotePort uint32
+}
+
+func addrFromNetOrder(v uint32) netip.Addr {
+	return netip.AddrFrom4([4]byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)})
+}
+
+// resetTCPConnectionsTo aborts every live IPv4 connection whose remote address
+// falls inside one of the given prefixes, so the next request re-resolves its
+// route. Only ESTABLISHED and SYN_SENT are touched: those are the ones holding
+// a stale path. Closing states are already going away on their own.
+func resetTCPConnectionsTo(prefixes []netip.Prefix) int {
+	if len(prefixes) == 0 {
+		return 0
+	}
+
+	// Sized, then read. The table can grow between the two calls (connections
+	// open constantly), which comes back as ERROR_INSUFFICIENT_BUFFER with the
+	// new size filled in — hence the retry rather than a single attempt.
+	var (
+		size uint32
+		buf  []byte
+		got  bool
+	)
+	procGetExtendedTCPTable.Call(
+		0, uintptr(unsafe.Pointer(&size)), 0,
+		uintptr(windows.AF_INET), tcpTableOwnerPIDAll, 0,
+	)
+	for attempt := 0; attempt < 4 && size > 0; attempt++ {
+		buf = make([]byte, size)
+		rc, _, _ := procGetExtendedTCPTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0,
+			uintptr(windows.AF_INET), tcpTableOwnerPIDAll, 0,
+		)
+		if rc == 0 {
+			got = true
+			break
+		}
+		if rc != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) {
+			log.Printf("resetTCP: GetExtendedTcpTable failed (%d)", rc)
+			return 0
+		}
+	}
+	if !got {
+		log.Printf("resetTCP: could not read the connection table")
+		return 0
+	}
+
+	const headerSize = unsafe.Sizeof(uint32(0))
+	rowSize := unsafe.Sizeof(mibTCPRowOwnerPID{})
+	count := *(*uint32)(unsafe.Pointer(&buf[0]))
+
+	killed, failed := 0, 0
+	for i := uintptr(0); i < uintptr(count); i++ {
+		off := headerSize + i*rowSize
+		if off+rowSize > uintptr(len(buf)) {
+			break
+		}
+		row := (*mibTCPRowOwnerPID)(unsafe.Pointer(&buf[off]))
+		if row.State != mibTCPStateEstablished && row.State != mibTCPStateSynSent {
+			continue
+		}
+		remote := addrFromNetOrder(row.RemoteAddr)
+		hit := false
+		for _, p := range prefixes {
+			if p.Contains(remote) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		kill := mibTCPRow{
+			State:      mibTCPStateDeleteTCB,
+			LocalAddr:  row.LocalAddr,
+			LocalPort:  row.LocalPort,
+			RemoteAddr: row.RemoteAddr,
+			RemotePort: row.RemotePort,
+		}
+		if r, _, _ := procSetTCPEntry.Call(uintptr(unsafe.Pointer(&kill))); r != 0 {
+			failed++
+		} else {
+			killed++
+		}
+	}
+
+	log.Printf("resetTCP: %d connection(s) reset, %d refused (%d prefixes changed)",
+		killed, failed, len(prefixes))
+	return killed
+}
+
+// tunnelLUIDOf is the tunnel adapter's LUID, or 0 when there is no tunnel.
+// Passed to findDefaultRouteV4 so the tunnel's own routes are never mistaken
+// for the way out to the internet.
+func tunnelLUIDOf(st *tunnelState) winipcfg.LUID {
+	if st == nil {
+		return 0
+	}
+	return winipcfg.LUID(tunnelLUID(st.wgDev))
+}
+
+func clearBypass(st *tunnelState) {
+	if st == nil || len(st.bypassIPs) == 0 {
+		return
+	}
+	for prefix := range st.bypassIPs {
+		if err := st.physLUID.DeleteRoute(prefix, st.physGW); err != nil {
+			log.Printf("clearBypass: DeleteRoute(%s) failed: %v", prefix, err)
+		}
+	}
+	log.Printf("clearBypass: removed %d bypass routes", len(st.bypassIPs))
+	st.bypassIPs = nil
+}
+
+// ─── IPv6 leak protection ────────────────────────────────
+//
+// The server is IPv4-only: the generated config carries a single
+// "AllowedIPs = 0.0.0.0/0" and the interface has no IPv6 address at all.
+// Nothing was ever done about IPv6, which meant that on any connection where
+// the ISP hands out IPv6, every IPv6-capable destination — which today is
+// most large sites — kept flowing outside the tunnel while the app showed
+// "Подключено". The whitelist had no effect on it either way.
+//
+// Routing IPv6 into the tunnel isn't possible without IPv6 on the server, so
+// the fix is to stop it leaving at all while the tunnel is up: one outbound
+// Windows Firewall rule covering the whole IPv6 space. Applications get an
+// immediate failure on the v6 attempt and fall straight over to IPv4 (the
+// browsers' Happy Eyeballs path), rather than the multi-second stall a
+// blackhole route would cause.
+//
+// The rule is identified by name and deleted both on teardown and at service
+// start, so an unclean exit can't leave the machine with IPv6 switched off.
+const ipv6BlockRuleName = "KitoFtorVPN Block IPv6"
+
+// 2000::/3 is the whole globally routable IPv6 range. Deliberately narrower
+// than ::/0: link-local (fe80::/10) and unique-local (fc00::/7) never leave
+// the local network, so blocking them would break LAN neighbour discovery and
+// local devices for no privacy gain.
+const ipv6GlobalRange = "2000::/3"
+
+func blockIPv6() {
+	unblockIPv6() // never stack duplicate rules
+	err := runNetshErr("advfirewall", "firewall", "add", "rule",
+		"name="+ipv6BlockRuleName,
+		"dir=out", "action=block", "enable=yes",
+		"profile=any", "remoteip="+ipv6GlobalRange)
+	if err != nil {
+		// Some netsh builds are picky about prefix notation on remoteip;
+		// the explicit range is accepted everywhere.
+		log.Printf("blockIPv6: prefix form rejected (%v), retrying with range", err)
+		runNetsh("advfirewall", "firewall", "add", "rule",
+			"name="+ipv6BlockRuleName,
+			"dir=out", "action=block", "enable=yes",
+			"profile=any",
+			"remoteip=2000::-3fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+	}
+}
+
+func unblockIPv6() {
+	runNetsh("advfirewall", "firewall", "delete", "rule", "name="+ipv6BlockRuleName)
+}
+
+// The firewall rule above is the fast, clean block — applications get an
+// immediate error and fall over to IPv4 at once. But it is only enforced while
+// Windows Firewall is actually running, and plenty of people turn it off. With
+// it off, the rule is created, reports success, and does nothing: IPv6 keeps
+// leaking around the tunnel while the app shows a healthy connection.
+//
+// So there is a second, independent layer that lives in the routing table
+// instead. Globally routable IPv6 is pointed into the tunnel adapter, where
+// the WireGuard device has no IPv6 peer address to match it against and drops
+// it. Slower to fail than the firewall rule — a connection attempt times out
+// rather than being refused, though browsers move on to IPv4 within a fraction
+// of a second — but it cannot be switched off by a firewall setting.
+//
+// Both layers are applied together. Whichever is in force, IPv6 does not
+// leave the machine outside the tunnel. Teardown destroys the adapter, which
+// takes this route with it; the explicit delete is for tidiness and for the
+// netsh fallback path.
+func sinkIPv6(tunLUID winipcfg.LUID) {
+	prefix := netip.MustParsePrefix("2000::/3")
+	if tunLUID != 0 {
+		if err := tunLUID.AddRoute(prefix, netip.IPv6Unspecified(), 1); err == nil {
+			log.Printf("sinkIPv6: %s routed into the tunnel", prefix)
+			return
+		} else {
+			log.Printf("sinkIPv6: AddRoute failed: %v", err)
+		}
+	}
+	runNetsh("interface", "ipv6", "add", "route", prefix.String(),
+		"interface="+tunnelInterfaceName, "metric=1")
+}
+
+func unsinkIPv6(tunLUID winipcfg.LUID) {
+	prefix := netip.MustParsePrefix("2000::/3")
+	if tunLUID != 0 {
+		if err := tunLUID.DeleteRoute(prefix, netip.IPv6Unspecified()); err == nil {
+			return
+		}
+	}
+	runNetsh("interface", "ipv6", "delete", "route", prefix.String(),
+		"interface="+tunnelInterfaceName)
+}
+
+func cleanupRoutes(pc *parsedConfig, physLUID winipcfg.LUID, physGW netip.Addr, defaultGW string, wgDev tun.Device) {
 	var wg sync.WaitGroup
 
 	luid := tunnelLUID(wgDev)
@@ -960,6 +1600,13 @@ func cleanupRoutes(pc *parsedConfig, defaultGW string, wgDev tun.Device) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			if physLUID != 0 && physGW.IsValid() {
+				if ep, perr := netip.ParseAddr(pc.endpointHost); perr == nil && ep.Is4() {
+					if err := physLUID.DeleteRoute(netip.PrefixFrom(ep, 32), physGW); err == nil {
+						return
+					}
+				}
+			}
 			runCmd("route", "delete", pc.endpointHost+"/32")
 		}()
 	}
@@ -1035,10 +1682,17 @@ func getInterfaceIndex() string {
 }
 
 func runNetsh(args ...string) {
+	runNetshErr(args...)
+}
+
+// runNetshErr is runNetsh for the callers that need to know whether it
+// worked (currently only the IPv6 block, which has a fallback syntax).
+func runNetshErr(args ...string) error {
 	cmd := exec.Command("netsh", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	out, err := cmd.CombinedOutput()
 	log.Printf("netsh %s -> %s (err=%v)", strings.Join(args, " "), strings.TrimSpace(string(out)), err)
+	return err
 }
 
 func runCmd(name string, args ...string) {
@@ -1116,8 +1770,36 @@ func (c *pipeConn) Close() error {
 	}
 	c.mu.Unlock()
 	if c.server {
+		// FlushFileBuffers first, and this ordering is the whole point.
+		//
+		// DisconnectNamedPipe throws away whatever is still sitting in the
+		// pipe unread — the documented behaviour, and here that "whatever" is
+		// the reply we just wrote. Whether the client got it or lost it came
+		// down to which side the scheduler ran first, and the client saw the
+		// loss as a reset connection rather than as an answer.
+		//
+		// On the server end of a named pipe FlushFileBuffers means "block
+		// until the client has read everything", which is exactly the wait
+		// that was missing.
+		//
+		// It is given a ceiling because that wait has no natural end if the
+		// client walks away without reading: this runs on one of a small
+		// fixed number of acceptor goroutines, so a few permanent blocks here
+		// would take the control channel out entirely. On timeout we go ahead
+		// and disconnect, which releases the flush as well.
+		h := windows.Handle(c.f.Fd())
+		flushed := make(chan struct{})
+		go func() {
+			windows.FlushFileBuffers(h)
+			close(flushed)
+		}()
+		select {
+		case <-flushed:
+		case <-time.After(2 * time.Second):
+			log.Printf("pipeConn: client did not read the reply within 2s, dropping it")
+		}
 		// Let the client observe end-of-file before the handle goes away.
-		windows.DisconnectNamedPipe(windows.Handle(c.f.Fd()))
+		windows.DisconnectNamedPipe(h)
 	}
 	return c.f.Close()
 }
@@ -1215,10 +1897,19 @@ func (l *pipeListener) Accept() (net.Conn, error) {
 func (l *pipeListener) Close() error {
 	l.once.Do(func() {
 		close(l.closed)
-		// Wake up the Accept currently parked in ConnectNamedPipe. Without
+		// Wake up the Accepts currently parked in ConnectNamedPipe. Without
 		// this the service would hang on stop until some client happened to
 		// connect — including during a machine shutdown.
-		if h, err := dialPipeRaw(500 * time.Millisecond); err == nil {
+		//
+		// One dial per acceptor: a single connection only releases a single
+		// parked instance, so with several acceptors the rest would stay
+		// blocked and the service would hang on stop anyway. Dialling a few
+		// extra times is harmless.
+		for i := 0; i < acceptorCount; i++ {
+			h, err := dialPipeRaw(500 * time.Millisecond)
+			if err != nil {
+				break
+			}
 			windows.CloseHandle(h)
 		}
 	})

@@ -90,11 +90,16 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.dat');
 const SETTINGS_FILE = path.join(DATA_DIR, 'settings.json');
 const CONNECT_TIME_FILE = path.join(DATA_DIR, 'connect_time.dat');
 const GUEST_FILE = path.join(DATA_DIR, 'guest_mode.dat');
+const BYPASS_CACHE_FILE = path.join(DATA_DIR, 'bypass_cache.json');
 const TASK_NAME = 'KitoFtorVPNAutostart';
 
-function showNotification(title, body, onlyWhenHidden = false) {
+// Notifications are unconditional. They used to be suppressed whenever the
+// main window happened to be visible, which sounds reasonable until you pair
+// it with autostart: the app launches, the window is on screen, the tunnel
+// comes up — and the one notification confirming it is swallowed precisely in
+// the situation where the user is least likely to be watching the window.
+function showNotification(title, body) {
   if (!Notification.isSupported()) return;
-  if (onlyWhenHidden && mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) return;
   const icon = (typeof APP_ICON !== 'undefined') ? APP_ICON : undefined;
   new Notification({ title, body, icon, silent: true }).show();
 }
@@ -134,6 +139,7 @@ let sessionEnding = false;
 async function stopTunnelOnExit() {
   if (tunnelStopped) return;
   tunnelStopped = true;
+  stopBypassRefresh();
   // Hard cap: if the tunnel exe is somehow stuck (antivirus scanning it,
   // disk thrashing, whatever) we must not hang forever waiting on it.
   // Better to bail and let the next boot's stale-marker cleanup
@@ -156,6 +162,7 @@ async function stopTunnelOnExit() {
 function stopTunnelOnExitSync() {
   if (tunnelStopped) return;
   tunnelStopped = true;
+  stopBypassRefresh();
   const opts = { timeout: 4000, windowsHide: true, stdio: 'ignore' };
   try { execFileSync(TUNNEL_EXE, ['stop'], opts); } catch (e) {}
   try { execFileSync(TUNNEL_EXE, ['service-stop'], opts); } catch (e) {}
@@ -185,6 +192,9 @@ let authPort = 0;
 let cachedToken = null;
 let isGuest = false;
 let isQuitting = false;
+// Set when the user lands back on the login screen (logout, guest exit, or a
+// session the server rejected) so a queued autoconnect doesn't fire behind it.
+let autoconnectCancelled = false;
 
 // ─── Settings ────────────────────────────────────────────
 
@@ -193,13 +203,13 @@ function loadSettings() {
     if (fs.existsSync(SETTINGS_FILE)) {
       const loaded = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf-8'));
       return {
-        autostart: false, autoconnect: false, whitelist: [],
+        autostart: false, autoconnect: false, startMinimized: false, whitelist: [],
         updateSkipPrompt: false, updatePendingVersion: null,
         ...loaded,
       };
     }
   } catch(e) {}
-  return { autostart: false, autoconnect: false, whitelist: [], updateSkipPrompt: false, updatePendingVersion: null };
+  return { autostart: false, autoconnect: false, startMinimized: false, whitelist: [], updateSkipPrompt: false, updatePendingVersion: null };
 }
 
 function saveSettings(settings) {
@@ -211,7 +221,57 @@ function saveSettings(settings) {
   }
 }
 
-// ─── Whitelist (split tunneling via AllowedIPs subtraction) ────
+// ─── Whitelist (split tunneling via bypass routes) ────────
+//
+// How this works now, and why it changed.
+//
+// Before: the whitelist was resolved to IPs, each IP was widened to its /24,
+// and those blocks were *subtracted* from the peer's "AllowedIPs = 0.0.0.0/0"
+// before the config was handed to the tunnel. Three problems came out of that,
+// and they were the reason whitelisted sites still went through the VPN:
+//
+//   1. AllowedIPs is only read when the WireGuard device is created, so every
+//      whitelist edit meant a full disconnect/reconnect — and nothing could be
+//      corrected while a connection was live.
+//   2. Carving N holes out of 0.0.0.0/0 needs roughly 24 CIDRs per hole. A
+//      list of 30 domains became 600+ routes. That is what made connecting
+//      slow enough to need fixing in the first place.
+//   3. Worst of all, the addresses were resolved *before* connecting, using
+//      the ISP's resolver, while the browser afterwards resolves through the
+//      tunnel's DNS (1.1.1.1) and gets entirely different addresses back for
+//      anything on a CDN. The list was carving holes at addresses the browser
+//      never visited.
+//
+// Now: the config is passed through untouched (AllowedIPs stays 0.0.0.0/0,
+// i.e. two routes) and the whitelist is sent separately to the tunnel service
+// as a list of addresses to route around it. Since that list can be updated on
+// a live tunnel, resolution happens *after* connecting, through the same DNS
+// the browser will use, and is refreshed on a timer so addresses that rotate
+// get picked up without the user noticing anything.
+
+const RESOLVE_TIMEOUT_MS = 3000;
+// How often the whitelist is re-resolved while connected. CDN records rotate
+// on the order of minutes, so a minute keeps up without being noisy.
+const BYPASS_REFRESH_MS = 60 * 1000;
+// An address stays routed around the tunnel for this long after it was last
+// seen in a DNS answer. Without a grace period, a large site that answers
+// with a rotating subset of its pool each time would have addresses added and
+// pulled from under open connections every refresh.
+const BYPASS_IP_TTL_MS = 30 * 60 * 1000;
+// Hard ceiling on installed bypass routes, so a pathological list (or a
+// domain fronted by a very large pool) can't grow the routing table without
+// bound. Oldest entries are dropped first.
+const BYPASS_MAX_IPS = 4000;
+
+// entry -> { ips: Set<string>, at: number }
+const _resolveCache = new Map();
+// ip -> last time it appeared in an answer. This is the authoritative set of
+// what should be bypassed; it is persisted so a reconnect can install the
+// previous session's addresses immediately instead of leaving whitelisted
+// sites going through the tunnel until the first resolve completes.
+const _bypassIPs = new Map();
+
+let bypassTimer = null;
 
 // Cleans a whitelist entry: strips protocol, path, port — returns bare domain or IP.
 function cleanWhitelistEntry(raw) {
@@ -224,38 +284,20 @@ function cleanWhitelistEntry(raw) {
     }
   }
   entry = entry.split('/')[0].split('?')[0].split('#')[0];
-  // Strip port (but not IPv6 brackets).
+  // Strip a trailing port. Only meaningful for hostnames and IPv4 here;
+  // bracketed IPv6 is left alone (and rejected further down anyway, since the
+  // tunnel blocks IPv6 outright rather than routing it).
   if (entry.includes(':') && !entry.startsWith('[')) {
-    entry = entry.split(':').slice(0, -1).join(':') || entry;
-    // Above is wrong for hostnames; keep it simple:
     entry = entry.split(':')[0];
   }
-  entry = entry.trim().replace(/\.$/, '');
+  entry = entry.trim().replace(/\.$/, '').toLowerCase();
   return entry || null;
 }
 
-// Returns true if the string looks like a plain IP or CIDR (no letters).
+// Returns true if the string looks like a plain IPv4 address or CIDR.
 function isIpOrCidr(s) {
   return /^[\d./]+$/.test(s);
 }
-
-// PERFORMANCE NOTE: this used to resolve every whitelist domain one at a
-// time (for...await), with no per-lookup timeout. A single slow/unreachable
-// domain (no A record, slow upstream resolver, etc.) could stall for
-// several seconds, and with ~30 domains in the list that easily added up
-// to the 20-30s connect/disconnect times. Two fixes, same output:
-//   1. All domains are resolved concurrently (Promise.all) instead of
-//      sequentially — wall time becomes "the slowest single lookup"
-//      instead of "the sum of every lookup".
-//   2. Each lookup gets a hard timeout (RESOLVE_TIMEOUT_MS) so one bad
-//      domain can't drag the whole whitelist down; it's just skipped,
-//      same as today's "resolve failed" case already does.
-// A short in-memory cache also avoids re-resolving the same domains on
-// every connect/disconnect within a short window (domains here are static
-// service whitelists, not something that needs resolving fresh every time).
-const RESOLVE_TIMEOUT_MS = 3000;
-const RESOLVE_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
-const _resolveCache = new Map(); // entry -> { resolved: Set<ip>, at: number }
 
 function withTimeout(promise, ms) {
   return Promise.race([
@@ -264,250 +306,410 @@ function withTimeout(promise, ms) {
   ]);
 }
 
-async function resolveDomainCached(entry) {
-  const cached = _resolveCache.get(entry);
-  if (cached && (Date.now() - cached.at) < RESOLVE_CACHE_TTL_MS) {
-    return cached.resolved;
-  }
-
-  let resolved = new Set();
-  try {
-    const addrs = await withTimeout(dns.resolve4(entry), RESOLVE_TIMEOUT_MS);
-    for (const a of addrs) resolved.add(a);
-  } catch(e) {
-    // Fallback: dns.lookup (uses system resolver).
-    try {
-      const all = await withTimeout(dns.lookup(entry, { all: true, family: 4 }), RESOLVE_TIMEOUT_MS);
-      for (const r of all) resolved.add(r.address);
-    } catch(e2) {
-      console.error(`whitelist: resolve ${entry} failed`);
+// Reads the DNS servers out of the stored config, so the whitelist can be
+// resolved through exactly the resolver the rest of the system is using once
+// the tunnel is up. This is the piece that makes the whitelist match reality:
+// asking a different resolver than the browser does gives different addresses
+// for anything CDN-hosted, and then the bypass routes cover addresses nobody
+// ever connects to.
+function extractDnsServers(confText) {
+  const out = [];
+  const re = /^\s*DNS\s*=\s*(.+)$/gim;
+  let m;
+  while ((m = re.exec(confText || '')) !== null) {
+    for (const part of m[1].split(',')) {
+      const v = part.trim();
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(v)) out.push(v);
     }
   }
-
-  _resolveCache.set(entry, { resolved, at: Date.now() });
-  return resolved;
+  return out;
 }
 
-// Resolves whitelist entries to a Set of IPs/CIDRs. For domains with multiple IPs
-// (typical for CDN), expands each IP to its /24 subnet — matches VPN.py behaviour.
-async function resolveWhitelistEntries(entries) {
-  const ips = new Set();
-  const domains = [];
+let _tunnelResolver = null;
+let _tunnelResolverServers = '';
 
-  for (const raw of entries) {
+function tunnelResolver(servers) {
+  if (!servers || servers.length === 0) return null;
+  const key = servers.join(',');
+  if (_tunnelResolver && _tunnelResolverServers === key) return _tunnelResolver;
+  try {
+    const r = new dns.Resolver({ timeout: RESOLVE_TIMEOUT_MS, tries: 1 });
+    r.setServers(servers);
+    _tunnelResolver = r;
+    _tunnelResolverServers = key;
+    return r;
+  } catch(e) {
+    return null;
+  }
+}
+
+// Resolves one hostname, asking both the VPN's own DNS servers and the system
+// resolver and merging the answers. Two resolvers rather than one because
+// which of them the browser ends up using depends on things outside this app
+// (DNS-over-HTTPS in the browser, Windows' own multi-adapter resolution
+// order); covering both means the bypass list holds whichever answer the
+// browser acts on.
+async function resolveOne(name, resolver) {
+  const found = new Set();
+  const attempts = [];
+
+  if (resolver) {
+    attempts.push(withTimeout(resolver.resolve4(name), RESOLVE_TIMEOUT_MS).catch(() => []));
+  }
+  attempts.push(withTimeout(dns.resolve4(name), RESOLVE_TIMEOUT_MS).catch(() => []));
+  attempts.push(
+    withTimeout(dns.lookup(name, { all: true, family: 4 }), RESOLVE_TIMEOUT_MS)
+      .then(rs => rs.map(r => r.address))
+      .catch(() => [])
+  );
+
+  const results = await Promise.all(attempts);
+  for (const list of results) {
+    for (const ip of list || []) {
+      if (/^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) found.add(ip);
+    }
+  }
+  return found;
+}
+
+// Expands a user's entry into the names actually worth resolving. Someone who
+// types "sberbank.ru" means the site, and the site is very often served from
+// "www.sberbank.ru" with a different address — leaving that out is a large
+// share of "I added it to the list and it still goes through the VPN".
+function expandHostVariants(entry) {
+  const names = [entry];
+  const labels = entry.split('.');
+  if (labels.length === 2) {
+    names.push('www.' + entry);
+  } else if (labels[0] === 'www' && labels.length === 3) {
+    names.push(labels.slice(1).join('.'));
+  }
+  return names;
+}
+
+// Resolves the whole whitelist and folds the result into _bypassIPs.
+// Literal addresses and CIDRs are passed through as written.
+async function refreshBypassSet(entries, dnsServers) {
+  const now = Date.now();
+  const literals = [];
+  const hosts = new Set();
+
+  for (const raw of entries || []) {
     const entry = cleanWhitelistEntry(raw);
     if (!entry) continue;
-
     if (isIpOrCidr(entry)) {
-      ips.add(entry);
+      literals.push(entry);
       continue;
     }
-    domains.push(entry);
+    for (const name of expandHostVariants(entry)) hosts.add(name);
   }
 
-  // Resolve every domain concurrently instead of one at a time.
-  const results = await Promise.all(domains.map(d => resolveDomainCached(d)));
+  const resolver = tunnelResolver(dnsServers);
+  const names = [...hosts];
+  const results = await Promise.all(names.map(async (name) => {
+    const cached = _resolveCache.get(name);
+    // A short cache only exists to avoid hammering the resolver when several
+    // things trigger a refresh at once; it is far shorter than the refresh
+    // interval so it never masks a genuine address change.
+    if (cached && (now - cached.at) < 15000) return cached.ips;
+    const ips = await resolveOne(name, resolver);
+    _resolveCache.set(name, { ips, at: now });
+    return ips;
+  }));
 
-  for (const resolved of results) {
-    // Expand every resolved IP to its /24 subnet. This helps with CDNs where
-    // a hostname resolves to a rotating set of IPs within the same /24 block.
-    for (const ip of resolved) {
-      const parts = ip.split('.');
-      if (parts.length === 4) {
-        ips.add(`${parts[0]}.${parts[1]}.${parts[2]}.0/24`);
-      }
+  for (const ips of results) {
+    for (const ip of ips) _bypassIPs.set(ip, now);
+  }
+  for (const lit of literals) _bypassIPs.set(lit, now);
+
+  // Drop addresses nothing has resolved to in a long while.
+  for (const [ip, seen] of _bypassIPs) {
+    if (now - seen > BYPASS_IP_TTL_MS) _bypassIPs.delete(ip);
+  }
+  // And trim the oldest if the list somehow still ran away.
+  if (_bypassIPs.size > BYPASS_MAX_IPS) {
+    const ordered = [..._bypassIPs.entries()].sort((a, b) => a[1] - b[1]);
+    for (let i = 0; i < ordered.length - BYPASS_MAX_IPS; i++) {
+      _bypassIPs.delete(ordered[i][0]);
     }
   }
-  return ips;
+
+  saveBypassCache();
+  return [..._bypassIPs.keys()];
 }
 
-// Parses "a.b.c.d/nn" or "a.b.c.d" into { ip: BigInt, bits: number }.
-// Returns null on invalid input.
-function parseCidr(s) {
-  const [ipStr, bitsStr] = s.split('/');
-  const parts = ipStr.split('.');
-  if (parts.length !== 4) return null;
-  let ip = 0n;
-  for (const p of parts) {
-    const n = parseInt(p, 10);
-    if (isNaN(n) || n < 0 || n > 255) return null;
-    ip = (ip << 8n) | BigInt(n);
-  }
-  let bits = bitsStr === undefined ? 32 : parseInt(bitsStr, 10);
-  if (isNaN(bits) || bits < 0 || bits > 32) return null;
-  // Normalise: zero out host bits.
-  const mask = bits === 0 ? 0n : ((1n << 32n) - 1n) ^ ((1n << BigInt(32 - bits)) - 1n);
-  return { ip: ip & mask, bits };
+// The resolved set survives restarts purely so that the moment a tunnel comes
+// up, last session's addresses can be pushed to it straight away. Whitelisted
+// sites are then bypassed from the first second rather than from whenever the
+// first DNS round completes.
+function saveBypassCache() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(BYPASS_CACHE_FILE, JSON.stringify([..._bypassIPs.entries()]), 'utf-8');
+  } catch(e) {}
 }
 
-function cidrToString({ ip, bits }) {
-  const a = Number((ip >> 24n) & 0xffn);
-  const b = Number((ip >> 16n) & 0xffn);
-  const c = Number((ip >> 8n) & 0xffn);
-  const d = Number(ip & 0xffn);
-  return `${a}.${b}.${c}.${d}/${bits}`;
-}
-
-// Splits a CIDR into two halves (one bit more specific).
-function splitCidr({ ip, bits }) {
-  if (bits >= 32) return null;
-  const childBits = bits + 1;
-  const halfSize = 1n << BigInt(32 - childBits);
-  return [
-    { ip: ip, bits: childBits },
-    { ip: ip + halfSize, bits: childBits },
-  ];
-}
-
-// True if `a` fully contains `b`.
-function cidrContains(a, b) {
-  if (a.bits > b.bits) return false;
-  const mask = a.bits === 0 ? 0n : ((1n << 32n) - 1n) ^ ((1n << BigInt(32 - a.bits)) - 1n);
-  return (b.ip & mask) === a.ip;
-}
-
-// Subtracts `excluded` (array of CIDRs) from `network` (CIDR).
-// Returns array of CIDRs that cover `network` minus all `excluded`.
-// Mirrors Python's ipaddress.address_exclude().
-function subtractCidrs(network, excluded) {
-  let result = [network];
-  for (const exc of excluded) {
-    const next = [];
-    for (const n of result) {
-      if (!cidrContains(n, exc) && !cidrContains(exc, n)) {
-        // No overlap.
-        next.push(n);
-        continue;
-      }
-      if (cidrContains(exc, n)) {
-        // exc fully covers n → n disappears.
-        continue;
-      }
-      // n contains exc — split n in halves, recurse by pushing back.
-      let queue = [n];
-      while (queue.length) {
-        const cur = queue.pop();
-        if (cur.ip === exc.ip && cur.bits === exc.bits) {
-          // Exactly equals the excluded block → drop.
-          continue;
-        }
-        if (!cidrContains(cur, exc)) {
-          // The half doesn't contain exc → keep it whole.
-          next.push(cur);
-          continue;
-        }
-        // The half still contains exc → split further.
-        const halves = splitCidr(cur);
-        if (!halves) { next.push(cur); continue; }
-        queue.push(halves[0], halves[1]);
-      }
+function loadBypassCache() {
+  try {
+    if (!fs.existsSync(BYPASS_CACHE_FILE)) return;
+    const parsed = JSON.parse(fs.readFileSync(BYPASS_CACHE_FILE, 'utf-8'));
+    if (!Array.isArray(parsed)) return;
+    const now = Date.now();
+    for (const pair of parsed) {
+      if (!Array.isArray(pair) || pair.length !== 2) continue;
+      const [ip, seen] = pair;
+      if (typeof ip !== 'string' || typeof seen !== 'number') continue;
+      if (now - seen > BYPASS_IP_TTL_MS) continue;
+      _bypassIPs.set(ip, seen);
     }
-    result = next;
-  }
-  // Sort by numeric IP for stable output.
-  result.sort((a, b) => (a.ip < b.ip ? -1 : a.ip > b.ip ? 1 : 0));
-  return result;
+  } catch(e) {}
 }
 
-// Extracts Endpoint IPs from a config so we never accidentally exclude the
-// VPN server itself (tunnel would fail to connect).
-function extractEndpointIPs(confText) {
-  const ips = [];
-  const re = /^\s*Endpoint\s*=\s*([^\s:]+)/gim;
-  let m;
-  while ((m = re.exec(confText)) !== null) {
-    if (m[1] && /^[\d.]+$/.test(m[1])) ips.push(m[1]);
+// Removes from the bypass set exactly the addresses that belonged to entries
+// the user just deleted, leaving everything else installed and untouched.
+//
+// The address -> entry link comes from _resolveCache. If it isn't there (the
+// app was restarted since the last resolve, so nothing was cached) there is no
+// way to tell which addresses belonged to what, and the old blunt behaviour is
+// the only correct fallback: drop everything and let the immediate re-resolve
+// rebuild the set.
+function dropRemovedFromBypass(previous, current) {
+  const kept = new Set();
+  for (const raw of current || []) {
+    const e = cleanWhitelistEntry(raw);
+    if (e) kept.add(e);
   }
-  return ips;
-}
 
-// Modifies .conf text: subtracts resolved whitelist IPs from AllowedIPs = 0.0.0.0/0.
-// Returns modified text, or original if nothing to do / on error.
-async function applyWhitelistToConfig(confText, whitelistEntries) {
-  if (!whitelistEntries || whitelistEntries.length === 0) return confText;
-
-  const excludedSet = await resolveWhitelistEntries(whitelistEntries);
-  if (excludedSet.size === 0) return confText;
-
-  // Never exclude the VPN endpoint itself.
-  const endpointIPs = extractEndpointIPs(confText);
-  for (const ep of endpointIPs) excludedSet.delete(ep);
-
-  // Parse to CIDR objects.
-  const excluded = [];
-  for (const s of excludedSet) {
-    const c = parseCidr(s.includes('/') ? s : `${s}/32`);
-    if (c) excluded.push(c);
+  const goneNames = [];
+  const goneLiterals = [];
+  for (const raw of previous || []) {
+    const e = cleanWhitelistEntry(raw);
+    if (!e || kept.has(e)) continue;
+    if (isIpOrCidr(e)) goneLiterals.push(e);
+    else goneNames.push(...expandHostVariants(e));
   }
-  if (excluded.length === 0) return confText;
 
-  // Replace AllowedIPs lines containing 0.0.0.0/0.
-  const lines = confText.split(/\r?\n/);
-  let modified = false;
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const stripped = line.trim();
-    if (!/^allowedips\s*=/i.test(stripped)) continue;
-    const value = stripped.split('=', 2)[1] || '';
-    const nets = value.split(',').map(n => n.trim()).filter(Boolean);
+  if (goneNames.length === 0 && goneLiterals.length === 0) return;
 
-    const out = [];
-    for (const n of nets) {
-      if (n === '0.0.0.0/0') {
-        const sub = subtractCidrs(parseCidr('0.0.0.0/0'), excluded);
-        out.push(...sub.map(cidrToString));
-        modified = true;
-      } else {
-        out.push(n);
-      }
+  for (const name of goneNames) {
+    const cached = _resolveCache.get(name);
+    if (!cached) {
+      // Unknown addresses for a removed domain — can't be surgical.
+      _resolveCache.clear();
+      _bypassIPs.clear();
+      return;
     }
-    lines[i] = 'AllowedIPs = ' + out.join(', ');
+    for (const ip of cached.ips || []) _bypassIPs.delete(ip);
+    _resolveCache.delete(name);
   }
-  if (!modified) return confText;
-  return lines.join('\n');
+  for (const lit of goneLiterals) _bypassIPs.delete(lit);
+}
+
+// Hands the current list to the tunnel service, which installs the routes.
+// An empty list is still worth sending — that is how routes get removed after
+// the user clears the whitelist.
+async function pushBypassToTunnel(ips) {
+  try {
+    await tunnelBypassStdin((ips || []).join('\n'));
+  } catch(e) {
+    console.error('pushBypassToTunnel error:', e.message);
+  }
+}
+
+// Resolve + push, in that order. Called right after connecting and then on a
+// timer, and directly whenever the user edits the list.
+async function applyWhitelistNow() {
+  const settings = loadSettings();
+  const entries = Array.isArray(settings.whitelist) ? settings.whitelist : [];
+  if (entries.length === 0) {
+    _bypassIPs.clear();
+    saveBypassCache();
+    await pushBypassToTunnel([]);
+    return 0;
+  }
+  let dnsServers = [];
+  try {
+    const conf = await loadConfig();
+    dnsServers = extractDnsServers(conf);
+  } catch(e) {}
+  const ips = await refreshBypassSet(entries, dnsServers);
+  await pushBypassToTunnel(ips);
+  return ips.length;
+}
+
+// Starts the refresh loop and does the immediate first pass. The cached set is
+// pushed synchronously first so there is no window where the whitelist isn't
+// in effect yet.
+function startBypassRefresh() {
+  stopBypassRefresh();
+  const settings = loadSettings();
+  const entries = Array.isArray(settings.whitelist) ? settings.whitelist : [];
+  if (entries.length === 0) return;
+
+  // Cached addresses first, then the fresh resolve — chained rather than
+  // fired together, so two bypass updates never contend for the service's
+  // single control channel at the moment the tunnel has just come up.
+  (async () => {
+    if (_bypassIPs.size > 0) {
+      await pushBypassToTunnel([..._bypassIPs.keys()]);
+    }
+    await applyWhitelistNow();
+  })().catch(e => console.error('bypass first pass:', e));
+
+  bypassTimer = setInterval(() => {
+    applyWhitelistNow().catch(e => console.error('bypass refresh:', e));
+  }, BYPASS_REFRESH_MS);
+}
+
+function stopBypassRefresh() {
+  if (bypassTimer) { clearInterval(bypassTimer); bypassTimer = null; }
 }
 
 // ─── Autostart (Registry) ────────────────────────────────
 
-function setAutostart(enabled) {
+// Builds the Task Scheduler job as a full XML definition rather than the
+// shorthand schtasks /Create /TR ... form.
+//
+// The shorthand works, but every setting it doesn't mention is filled in by
+// Windows with a default, and two of those defaults are actively wrong for a
+// VPN client that lives in the tray:
+//
+//   • DisallowStartIfOnBatteries / StopIfGoingOnBatteries default to true. On
+//     a laptop that means autostart simply doesn't happen unless the machine
+//     is plugged in at logon — and that the app gets stopped the moment it's
+//     unplugged. Nobody expects their VPN to switch off when they pick up
+//     their laptop.
+//   • ExecutionTimeLimit defaults to three days, after which the scheduler
+//     terminates the task. For anything that runs continuously that's a
+//     process being killed on a timer, with no message and no obvious cause —
+//     on a machine that isn't rebooted, the VPN would vanish every third day.
+//
+// PT0S is the scheduler's way of saying "no time limit".
+function buildAutostartXml(exePath, hidden) {
+  const esc = (v) => String(v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const user = process.env.USERDOMAIN
+    ? `${process.env.USERDOMAIN}\\${process.env.USERNAME}`
+    : (process.env.USERNAME || '');
+  const args = hidden ? '\n      <Arguments>--hidden</Arguments>' : '';
+  // Element order inside <Settings> is fixed by the task schema — the
+  // scheduler rejects the file outright if they're rearranged.
+  return `<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Author>KitoFtorVPN</Author>
+    <Description>Автозапуск KitoFtorVPN при входе в Windows</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>${esc(user)}</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>${esc(user)}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>false</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <WakeToRun>false</WakeToRun>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>${esc(exePath)}</Command>${args}
+    </Exec>
+  </Actions>
+</Task>
+`;
+}
+
+function setAutostart(enabled, hidden) {
   const exePath = process.execPath;
+  const { execFileSync } = require('child_process');
   try {
-    if (enabled) {
-      // Task Scheduler is required because the app runs as Administrator
-      // (requireAdministrator in package.json). Registry HKCU\Run cannot
-      // elevate UAC, so the app would silently fail to start on boot.
-      const { execFileSync } = require('child_process');
-      // Delete first to avoid "already exists" error.
-      try { execFileSync('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { stdio: 'pipe' }); } catch(e) {}
-      execFileSync('schtasks', [
-        '/Create',
-        '/TN', TASK_NAME,
-        '/TR', `"${exePath}"`,
-        '/SC', 'ONLOGON',
-        '/RL', 'HIGHEST',
-        '/F',
-      ], { stdio: 'pipe' });
-    } else {
-      const { execFileSync } = require('child_process');
-      try { execFileSync('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { stdio: 'pipe' }); } catch(e) {}
+    // Delete first either way: /Create /F would overwrite, but removing it
+    // unconditionally keeps the disable path and the rewrite path identical.
+    try { execFileSync('schtasks', ['/Delete', '/TN', TASK_NAME, '/F'], { stdio: 'pipe' }); } catch(e) {}
+    if (!enabled) return;
+
+    // Task Scheduler rather than HKCU\Run because the app runs elevated
+    // (requestedExecutionLevel in package.json), and a Run key entry cannot
+    // raise UAC — it would fail silently at every logon.
+    const xmlPath = path.join(app.getPath('temp'), 'kitoftorvpn-autostart.xml');
+    // The scheduler expects the file in UTF-16, matching the declaration in
+    // the header above.
+    fs.writeFileSync(xmlPath, '\ufeff' + buildAutostartXml(exePath, hidden), 'utf16le');
+    try {
+      execFileSync('schtasks', ['/Create', '/TN', TASK_NAME, '/XML', xmlPath, '/F'], { stdio: 'pipe' });
+    } finally {
+      try { fs.unlinkSync(xmlPath); } catch(e) {}
     }
   } catch(e) {
     console.error('setAutostart error:', e);
+    // If the scheduler refused the XML for any reason, fall back to the
+    // shorthand form. Its defaults are worse, but an autostart with bad
+    // defaults beats no autostart at all.
+    if (enabled) {
+      try {
+        execFileSync('schtasks', [
+          '/Create', '/TN', TASK_NAME,
+          '/TR', hidden ? `"${exePath}" --hidden` : `"${exePath}"`,
+          '/SC', 'ONLOGON', '/RL', 'HIGHEST', '/F',
+        ], { stdio: 'pipe' });
+      } catch(e2) {
+        console.error('setAutostart fallback error:', e2);
+      }
+    }
   }
 }
 
 let _autostartCache = null;
 
-function getAutostartEnabled() {
+// Returns { enabled, hidden, current }. Reading the registered task as XML,
+// rather than just checking that it exists, is what lets the startup re-sync
+// notice two kinds of drift: the "запускать свёрнутым" setting changed but the
+// task still carries the old command line, and — via `current` — the task was
+// registered by an older build that left Windows' battery and run-time-limit
+// defaults in place. Either way it gets rewritten.
+function getAutostartState() {
   if (_autostartCache !== null) return _autostartCache;
   try {
     const { execFileSync } = require('child_process');
-    execFileSync('schtasks', ['/Query', '/TN', TASK_NAME], { stdio: 'pipe' });
-    _autostartCache = true;
+    const xml = String(execFileSync('schtasks', ['/Query', '/TN', TASK_NAME, '/XML', 'ONE'], {
+      stdio: 'pipe', encoding: 'utf16le',
+    }));
+    _autostartCache = {
+      enabled: true,
+      hidden: /--hidden/.test(xml),
+      current: /<DisallowStartIfOnBatteries>false</.test(xml)
+        && /<ExecutionTimeLimit>PT0S</.test(xml),
+    };
   } catch(e) {
-    _autostartCache = false;
+    _autostartCache = { enabled: false, hidden: false, current: false };
   }
   return _autostartCache;
+}
+
+function getAutostartEnabled() {
+  return getAutostartState().enabled;
 }
 
 // ─── DPAPI via Go helper ─────────────────────────────────
@@ -671,35 +873,28 @@ function updateTrayMenu() {
     { label: statusLabel, enabled: false },
     {
       label: isOn ? 'Отключиться' : 'Подключиться',
-      enabled: !isConnecting && hasConfig(),
+      // Connecting from the tray used to skip the subscription check the main
+      // window applies, so an expired subscription could still be connected
+      // from here. Same gate on both paths now.
+      enabled: !isConnecting && (isOn || canConnectNow()),
       click: async () => {
         if (isOn) {
           updateTrayIcon('connecting');
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnecting', { reason: 'disconnecting' });
-          try { await tunnelExec('stop'); } catch(e) {}
-          deleteConnectTime();
-          updateTrayIcon('off');
-          showNotification('KitoFtorVPN', 'VPN отключён', true);
+          try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
+          showNotification('KitoFtorVPN', 'VPN отключён');
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: false });
         } else {
           updateTrayIcon('connecting');
           if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnecting');
           try {
-            let conf = await loadConfig();
-            if (conf) {
-              const s = loadSettings();
-              if (Array.isArray(s.whitelist) && s.whitelist.length > 0) {
-                try { conf = await applyWhitelistToConfig(conf, s.whitelist); } catch(e) {}
-              }
-              await tunnelStartStdin(conf);
-              saveConnectTime();
-              updateTrayIcon('on');
-              showNotification('KitoFtorVPN', 'VPN подключён', true);
-              if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: true });
-            }
+            await connectVpn();
+            showNotification('KitoFtorVPN', 'VPN подключён');
+            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: true });
           } catch(e) {
             updateTrayIcon('off');
-            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: e.message });
+            showNotification('KitoFtorVPN', friendlyTunnelError(e.message));
+            if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: friendlyTunnelError(e.message) });
           }
         }
       }
@@ -734,6 +929,7 @@ function showMainWindow() {
 
 async function quitApp() {
   isQuitting = true;
+  stopBypassRefresh();
   // Stop the VPN tunnel first — tears down routes/adapter cleanly.
   try {
     await tunnelExec('stop');
@@ -824,66 +1020,164 @@ async function createWindow() {
 
   const settings = loadSettings();
 
-  // Auto-connect if setting enabled. We load the config for real rather
-  // than checking hasConfig(), because we need its contents a few lines
-  // down anyway.
+  // Auto-connect. Everything that decides whether that is allowed lives in
+  // runAutoconnect() — see the note there.
   if (settings.autoconnect && (cachedToken || isGuest)) {
-    // Notify renderer as soon as the window is ready so it shows "Подключение..."
-    // immediately — before the tunnel actually starts.
+    // Tell the renderer we intend to connect as soon as it can show it, so
+    // the window doesn't sit on "Не подключено" while we check.
     mainWindow.webContents.once('did-finish-load', () => {
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('vpn:autoconnecting');
       }
     });
+    setTimeout(() => { runAutoconnect().catch(e => console.error('autoconnect:', e)); }, 2000);
+  }
+}
 
-    setTimeout(async () => {
-      try {
-        // If the service already has a tunnel up (e.g. it survived a
-        // Windows Fast Startup "shutdown" that didn't actually tear the
-        // session down — the whole reason this got fixed), don't tear it
-        // down just to bring up an identical one. Just adopt its real
-        // connectStart and reflect "on" in the UI.
-        const already = await tunnelStatusFull();
-        if (already.state === 'RUNNING') {
-          if (already.connectStartMs) saveConnectTime(already.connectStartMs);
-          updateTrayIcon('on');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('vpn:autoconnected', { ok: true });
-          }
-          return;
-        }
+// ─── Subscription gate ───────────────────────────────────
+//
+// The main window has always known whether the subscription is active — it
+// fetches /api/sub to draw the status card. The main process didn't, which is
+// why two things could connect regardless of it: autoconnect at startup, and
+// the tray's "Подключиться". Both are here now, and both consult the same
+// answer the window shows.
+//
+// 'unknown' is a distinct outcome from 'expired' on purpose: it means the
+// server couldn't be reached, not that the subscription is bad.
+let subStatus = 'unknown'; // 'active' | 'expired' | 'none' | 'test_ended' | 'unknown'
 
-        let conf = await loadConfig();
-        if (conf) {
-          if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
-            try { conf = await applyWhitelistToConfig(conf, settings.whitelist); } catch(e) {}
-          }
-          updateTrayIcon('connecting');
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('vpn:autoconnecting');
-          }
-          await tunnelStartStdin(conf);
-          saveConnectTime();
-          updateTrayIcon('on');
-          showNotification('KitoFtorVPN', 'VPN подключён', true);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('vpn:autoconnected', { ok: true });
-          }
-        } else {
-          // No config to connect with — tell the renderer to fall back to
-          // the normal "off" state instead of being stuck on "Подключение...".
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('vpn:autoconnected', { ok: false });
-          }
-        }
-      } catch(e) {
-        console.error('autoconnect error:', e);
-        updateTrayIcon('off');
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: e.message });
-        }
+// The window reports every /api/sub result it gets, so the tray stays correct
+// as the subscription changes during a session (including expiring while the
+// app is open).
+ipcMain.handle('sub:report', (event, status) => {
+  if (typeof status === 'string' && status) subStatus = status;
+  updateTrayMenu();
+  return { ok: true };
+});
+
+// A guest has no account and therefore no subscription to check — that's the
+// whole point of guest mode, and it's how a manually issued config is used.
+function canConnectNow() {
+  if (!hasConfig()) return false;
+  if (isGuest) return true;
+  return subStatus === 'active';
+}
+
+// Raw GET against the API with the session cookie. Same request the renderer
+// makes through api:fetch, available to the main process.
+function apiGet(endpoint) {
+  return new Promise((resolve) => {
+    if (!cachedToken) return resolve({ error: 'no_token' });
+    const url = buildApiUrl(endpoint);
+    if (!url) return resolve({ error: 'bad_endpoint' });
+    const req = https.get(url, { headers: { 'Cookie': `cabinet_session=${cachedToken}` } }, (res) => {
+      let data = '';
+      res.on('data', (c) => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { resolve({ error: res.statusCode === 401 ? 'unauthorized' : 'parse_error' }); }
+      });
+    });
+    req.on('error', (e) => resolve({ error: e.message }));
+    req.setTimeout(10000, () => { req.destroy(); resolve({ error: 'timeout' }); });
+  });
+}
+
+// Checks the subscription, retrying a few times on network failure.
+//
+// The retries are not optional politeness: with autostart the app is running
+// seconds after logon, when the adapter may still be coming up and DNS isn't
+// answering yet. A single failed request there would look identical to "the
+// server says no", and the user would be told their subscription couldn't be
+// verified every single boot.
+async function fetchSubStatus(attempts = 3) {
+  for (let i = 0; i < attempts; i++) {
+    const sub = await apiGet('/api/sub');
+    if (sub && !sub.error && typeof sub.status === 'string') {
+      subStatus = sub.status;
+      return sub;
+    }
+    if (sub && sub.error === 'unauthorized') {
+      subStatus = 'unknown';
+      return sub;
+    }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, 4000));
+  }
+  subStatus = 'unknown';
+  return { error: 'unreachable' };
+}
+
+// Autoconnect, with the three refusals that were missing.
+//
+// Previously this checked only that a token or guest flag existed, then
+// connected. So it would happily bring the tunnel up with no config (the
+// window sat on "Подключение..." until it gave up), or with an expired
+// subscription — where the tunnel comes up against a peer the server has
+// already removed, producing a connection that carries no traffic. The window
+// meanwhile disabled its own power button because the subscription was
+// expired, leaving no way to switch off the thing that had just broken the
+// user's internet except the tray menu.
+//
+// Autostart itself is unaffected by all of this: the app still launches, it
+// just doesn't connect, and says why.
+async function runAutoconnect() {
+  if (autoconnectCancelled) return;
+  const notifyAndStop = (message) => {
+    updateTrayIcon('off');
+    if (message) showNotification('KitoFtorVPN', message);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('vpn:autoconnected', { ok: false, notice: message || null });
+    }
+  };
+
+  try {
+    // A tunnel that survived a Fast Startup "shutdown" is adopted rather than
+    // torn down and rebuilt identically.
+    const already = await tunnelStatusFull();
+    if (already.state === 'RUNNING') {
+      if (already.connectStartMs) saveConnectTime(already.connectStartMs);
+      updateTrayIcon('on');
+      startBypassRefresh();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('vpn:autoconnected', { ok: true });
       }
-    }, 2000);
+      return;
+    }
+
+    if (!hasConfig()) {
+      return notifyAndStop('Автоподключение отменено: не загружен файл конфигурации');
+    }
+
+    if (!isGuest) {
+      const sub = await fetchSubStatus();
+      if (sub.error === 'unauthorized') {
+        return notifyAndStop('Автоподключение отменено: требуется вход в аккаунт');
+      }
+      if (sub.error) {
+        return notifyAndStop('Автоподключение отменено: не удалось проверить подписку');
+      }
+      if (sub.status !== 'active') {
+        return notifyAndStop('Автоподключение отменено: подписка неактивна');
+      }
+    }
+
+    updateTrayIcon('connecting');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('vpn:autoconnecting');
+    }
+    await connectVpn();
+    showNotification('KitoFtorVPN', 'VPN подключён');
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('vpn:autoconnected', { ok: true });
+    }
+  } catch(e) {
+    console.error('autoconnect error:', e);
+    updateTrayIcon('off');
+    const msg = friendlyTunnelError(e.message);
+    showNotification('KitoFtorVPN', msg);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('vpn:autoconnected', { ok: false, error: msg });
+    }
   }
 }
 
@@ -935,6 +1229,7 @@ function sendUpdateProgress(percent) {
 // Нужно, чтобы свежескачанный инсталлятор не наткнулся на "VPN запущен,
 // закройте вручную" и чтобы ничего не висело в Диспетчере задач/Службах.
 async function stopTunnelForInstall() {
+  stopBypassRefresh();
   try { await tunnelExec('stop'); } catch(e) { /* не был запущен — ок */ }
   try { await tunnelExec('service-stop'); } catch(e) {
     console.error('stopTunnelForInstall: service-stop failed:', e.message);
@@ -1040,14 +1335,21 @@ app.whenReady().then(createWindow).then(() => {
   try {
     const s = loadSettings();
     const wantAutostart = !!s.autostart;
-    const actuallyEnabled = getAutostartEnabled();
-    if (wantAutostart !== actuallyEnabled) {
-      setAutostart(wantAutostart);
+    const wantHidden = !!s.startMinimized;
+    const actual = getAutostartState();
+    if (wantAutostart !== actual.enabled
+        || (wantAutostart && (wantHidden !== actual.hidden || !actual.current))) {
+      setAutostart(wantAutostart, wantHidden);
       _autostartCache = null;
     }
   } catch(e) {
     console.error('autostart re-sync error:', e);
   }
+
+  // Anything the previous session resolved is loaded up front, so if the
+  // tunnel is already up (adopted below) or comes up shortly, the whitelist
+  // is in force immediately rather than after the first DNS round.
+  loadBypassCache();
 
   // Warm up the background tunnel service right away. The service is now
   // persistent (created once, stays running) instead of being recreated on
@@ -1168,7 +1470,7 @@ function openSettings() {
   // Position to the left of main window with 12px gap, clamped to work area.
   const mainBounds = mainWindow ? mainWindow.getBounds() : { x: 500, y: 200, width: 380, height: 560 };
   const settingsWidth = 340;
-  const settingsHeight = 615;
+  const settingsHeight = 672; // grew by one row when "запускать свёрнутым" was added
   const gap = 12;
   const display = screen.getDisplayNearestPoint({ x: mainBounds.x, y: mainBounds.y });
   const wa = display.workArea;
@@ -1401,10 +1703,11 @@ ipcMain.handle('auth:telegram', async () => {
 ipcMain.handle('auth:logout', async () => {
   cachedToken = null;
   isGuest = false;
+  subStatus = 'unknown';
+  autoconnectCancelled = true;
   deleteToken();
   deleteGuestMode();
-  try { await tunnelExec('stop'); } catch(e) {}
-  updateTrayIcon('off');
+  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
   if (mainWindow) {
     resizeWindowFor('login');
     mainWindow.loadFile('ui/login.html');
@@ -1418,8 +1721,14 @@ ipcMain.handle('auth:logout', async () => {
 ipcMain.handle('auth:sessionExpired', async () => {
   cachedToken = null;
   isGuest = false;
-  try { await tunnelExec('stop'); } catch(e) {}
-  updateTrayIcon('off');
+  subStatus = 'unknown';
+  // The pending autoconnect has to be cancelled here, not just left to fail.
+  // It runs on a timer set at startup, and the session check that lands the
+  // user back on the login screen finishes well before that timer fires — so
+  // the tunnel came up two seconds after the app had decided the user wasn't
+  // logged in, leaving a connected VPN behind a login screen.
+  autoconnectCancelled = true;
+  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
   if (mainWindow) {
     resizeWindowFor('login');
     mainWindow.loadFile('ui/login.html');
@@ -1442,9 +1751,9 @@ ipcMain.handle('auth:guestLogin', async () => {
 // Leave guest mode — back to login screen.
 ipcMain.handle('auth:exitGuest', async () => {
   isGuest = false;
+  autoconnectCancelled = true;
   deleteGuestMode();
-  try { await tunnelExec('stop'); } catch(e) {}
-  updateTrayIcon('off');
+  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
   if (mainWindow) {
     resizeWindowFor('login');
     mainWindow.loadFile('ui/login.html');
@@ -1528,9 +1837,7 @@ ipcMain.handle('config:import', async () => {
       wasRunning = full.state === 'RUNNING';
     } catch(e) {}
     if (wasRunning) {
-      try { await tunnelExec('stop'); } catch(e) {}
-      deleteConnectTime();
-      updateTrayIcon('off');
+      try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
       notifyConfigChanged({ vpnState: 'off' });
     }
 
@@ -1567,10 +1874,8 @@ ipcMain.handle('config:exists', async () => {
 });
 
 ipcMain.handle('config:delete', async () => {
-  try { await tunnelExec('stop'); } catch(e) {}
+  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
   deleteConfigFile();
-  deleteConnectTime();
-  updateTrayIcon('off');
   notifyConfigChanged({ hasConfig: false, vpnState: 'off' });
   return { ok: true };
 });
@@ -1584,9 +1889,11 @@ ipcMain.handle('settings:set', (event, newSettings) => {
   const merged = { ...current, ...newSettings };
   saveSettings(merged);
 
-  // Apply autostart change
-  if (newSettings.autostart !== undefined) {
-    setAutostart(newSettings.autostart);
+  // Autostart and "start minimized" are one registration: the second is just
+  // an argument on the command line the first registers, so a change to
+  // either has to rewrite the task.
+  if (newSettings.autostart !== undefined || newSettings.startMinimized !== undefined) {
+    setAutostart(!!merged.autostart, !!merged.startMinimized);
     _autostartCache = null; // invalidate cache after change
   }
 
@@ -1631,46 +1938,48 @@ ipcMain.handle('whitelist:save', async (event, list) => {
     cleaned.push(v);
   }
   const current = loadSettings();
-  const merged = { ...current, whitelist: cleaned };
-  saveSettings(merged);
+  const previous = Array.isArray(current.whitelist) ? current.whitelist : [];
+  saveSettings({ ...current, whitelist: cleaned });
 
-  let restarted = false;
+  // Saving the list no longer restarts the tunnel. It used to have to: the
+  // whitelist was compiled into the peer's AllowedIPs, and that is only read
+  // when the WireGuard device is created. Bypass routes are installed on the
+  // live tunnel instead, so this is now a routing-table update measured in
+  // milliseconds, with no drop in connectivity and no "Применение..." state to
+  // sit through.
+  // An edit is an explicit instruction, so a domain the user just *removed*
+  // has to lose its addresses now rather than aging out over the normal
+  // 30-minute lifetime.
+  //
+  // Only the removed entries' addresses are dropped, though — not the whole
+  // set. Wiping everything meant every edit re-resolved all ~30 domains from
+  // scratch, and any host that happened to time out in that round lost its
+  // routes until the next refresh. Now that route changes also reset the
+  // connections sitting on them (see applyBypass on the Go side), that
+  // churn would be felt directly as sites dropping for no reason.
+  dropRemovedFromBypass(previous, cleaned);
+  saveBypassCache();
+
   try {
     const st = await tunnelStatus().catch(() => 'STOPPED');
     if (st === 'RUNNING') {
-      // Notify renderer so it can show a busy state and disable the button.
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send('vpn:reconnecting', { reason: 'whitelist' });
       }
-      updateTrayIcon('connecting');
-
-      await tunnelExec('stop').catch(() => {});
-      let conf = await loadConfig();
-      if (conf) {
-        if (cleaned.length > 0) {
-          try { conf = await applyWhitelistToConfig(conf, cleaned); } catch(e) {}
-        }
-        await tunnelStartStdin(conf);
-        saveConnectTime();
-        updateTrayIcon('on');
-        restarted = true;
-      } else {
-        updateTrayIcon('off');
-      }
-
+      await applyWhitelistNow();
+      startBypassRefresh();
       if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('vpn:reconnected', { ok: restarted });
+        mainWindow.webContents.send('vpn:reconnected', { ok: true });
       }
     }
   } catch(e) {
-    console.error('whitelist:save restart error:', e);
-    updateTrayIcon('off');
+    console.error('whitelist:save apply error:', e);
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('vpn:reconnected', { ok: false, error: e.message });
+      mainWindow.webContents.send('vpn:reconnected', { ok: true });
     }
   }
 
-  return { ok: true, count: cleaned.length, restarted };
+  return { ok: true, count: cleaned.length };
 });
 
 // ─── Connect time persistence ────────────────────────────
@@ -1706,6 +2015,8 @@ function deleteConnectTime() {
   try { fs.unlinkSync(CONNECT_TIME_FILE); } catch(e) {}
 }
 
+let statusMissStreak = 0;
+
 // ─── IPC: Tunnel management ──────────────────────────────
 
 // Technical errors from the tunnel process (Go/Windows API) come back in
@@ -1735,10 +2046,17 @@ function friendlyTunnelError(message) {
   return 'Не удалось подключиться. Попробуйте ещё раз или перезапустите приложение.';
 }
 
+// kitoftor-tunnel.exe is a console program, so every one of these calls makes
+// Windows create a console window for it. Even though it lives for a few
+// milliseconds, that window is created, painted and destroyed on the desktop —
+// which reads exactly like a right-click "Refresh": the whole desktop blinks,
+// and the cursor flips to "busy" for an instant. With the status poll running
+// every three seconds it never stops. windowsHide keeps the console off the
+// screen; the process itself and its output are unaffected.
 function tunnelExec(command, arg) {
   return new Promise((resolve, reject) => {
     const args = arg ? [command, arg] : [command];
-    execFile(TUNNEL_EXE, args, { timeout: 40000 }, (error, stdout, stderr) => {
+    execFile(TUNNEL_EXE, args, { timeout: 40000, windowsHide: true }, (error, stdout, stderr) => {
       if (error) reject(new Error(stderr || stdout || error.message));
       else resolve(stdout.trim());
     });
@@ -1766,7 +2084,14 @@ function tunnelExec(command, arg) {
 // the direct call fails, so behaviour stays identical on the error path.
 const CONTROL_PIPE = '\\\\.\\pipe\\KitoFtorVPNTunnel';
 
-function tunnelStatusDirect(timeoutMs = 2500) {
+// One attempt at the control channel, for any command. Rejected-because-busy
+// is a normal, transient outcome, not a failure — see tunnelPipeCommand below.
+//
+// Wire format is the same one the Go CLI uses (see sendCommand in
+// kitoftor-tunnel/main.go): "<COMMAND> <base64-body>\n" out, one line back.
+// Base64 is what lets a WireGuard config, newlines and all, travel as a single
+// line.
+function tunnelPipeAttempt(cmd, body, timeoutMs) {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection({ path: CONTROL_PIPE });
     let buf = '';
@@ -1784,15 +2109,14 @@ function tunnelStatusDirect(timeoutMs = 2500) {
     socket.on('error', (e) => finish(reject, e));
 
     socket.on('connect', () => {
-      // Empty body, same as the CLI: base64("") === "".
-      socket.write('STATUS \n');
+      const encoded = Buffer.from(body || '', 'utf-8').toString('base64');
+      socket.write(`${cmd} ${encoded}\n`);
     });
 
     socket.on('data', (chunk) => {
       buf += chunk.toString('utf-8');
       if (buf.includes('\n')) {
-        const line = buf.split('\n')[0].trim();
-        finish(resolve, parseStatusLine(line));
+        finish(resolve, buf.split('\n')[0].trim());
       }
     });
 
@@ -1800,9 +2124,48 @@ function tunnelStatusDirect(timeoutMs = 2500) {
       // Service closes the connection right after writing the reply; if we
       // got a full line in 'data' we've already resolved above, this is
       // just the no-trailing-newline edge case.
-      if (!settled) finish(resolve, parseStatusLine(buf.trim()));
+      if (!settled) finish(resolve, buf.trim());
     });
   });
+}
+
+// Retries a couple of times before giving up on the control channel.
+//
+// Windows refuses a named-pipe connection with ERROR_PIPE_BUSY when every
+// instance is occupied, which happens naturally whenever another caller is
+// mid-conversation. The Go CLI has always retried through that. This side
+// didn't: one refusal and it fell through to spawning kitoftor-tunnel.exe,
+// which is the process-per-poll this channel exists to replace. Worse, each
+// spawned process is itself another client, so a burst of contention kept
+// itself going — the log showed a status process every three seconds for a
+// minute after each connect.
+//
+// The service now keeps four instances waiting, so collisions should be rare;
+// these retries make them harmless when they do happen.
+async function tunnelPipeCommand(cmd, body, timeoutMs = 5000) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await tunnelPipeAttempt(cmd, body, timeoutMs);
+    } catch (e) {
+      lastErr = e;
+      const code = e && e.code;
+      // ENOENT here means "no free instance right now", not "no such pipe" —
+      // Windows reports both the same way through libuv. ECONNRESET and EOF
+      // are the shapes a reply that got discarded on the service side arrives
+      // in; that race is fixed there, but retrying costs nothing and is far
+      // cheaper than the process spawn this otherwise falls back to. Anything
+      // else (an actual timeout, a closed service) isn't worth retrying.
+      if (code !== 'EBUSY' && code !== 'ENOENT' && code !== 'EPIPE'
+          && code !== 'ECONNRESET' && code !== 'EOF') break;
+      await new Promise(r => setTimeout(r, 60 * (attempt + 1)));
+    }
+  }
+  throw lastErr || new Error('control channel unreachable');
+}
+
+async function tunnelStatusDirect(timeoutMs = 5000) {
+  return parseStatusLine(await tunnelPipeCommand('STATUS', '', timeoutMs));
 }
 
 // Parses the control channel's "RUNNING <unix_seconds>" / "STOPPED" reply.
@@ -1830,12 +2193,32 @@ async function tunnelStatus() {
   return (await tunnelStatusFull()).state;
 }
 
+// Records why the control channel refused, the first few times it happens.
+//
+// The fallback path is silent by design — it works, so nothing surfaces — and
+// console.error is invisible in a packaged app with no terminal attached. That
+// left "the app spawns a process for every status poll" visible in the tunnel
+// log while the actual reason stayed unknowable. This writes it down instead
+// of guessing. Capped, so a permanently broken channel can't grow a file
+// unbounded.
+let _pipeFailuresLogged = 0;
+function logPipeFailure(e) {
+  if (_pipeFailuresLogged >= 20) return;
+  _pipeFailuresLogged++;
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const line = `[${new Date().toISOString()}] code=${e && e.code} errno=${e && e.errno} syscall=${e && e.syscall} msg=${e && e.message}\n`;
+    fs.appendFileSync(path.join(DATA_DIR, 'pipe-debug.log'), line, 'utf-8');
+  } catch(err) {}
+}
+
 async function tunnelStatusFull() {
   try {
     return await tunnelStatusDirect();
   } catch (e) {
     // Control channel not reachable (service not installed/started yet) or
     // some unexpected hiccup — fall back to the CLI exactly like before.
+    logPipeFailure(e);
     try {
       const out = await tunnelExec('status');
       return parseStatusLine(out.trim());
@@ -1845,10 +2228,72 @@ async function tunnelStatusFull() {
   }
 }
 
-// Extract endpoint IP from .conf content (e.g. "Endpoint = 1.2.3.4:49792" -> "1.2.3.4")
-function tunnelStartStdin(configContent) {
+// Hands the split-tunneling list to the service. Separate from the config on
+// purpose: it can be sent at any time, including repeatedly on a live tunnel,
+// which is what allows whitelisted addresses to be re-resolved without a
+// reconnect.
+//
+// Straight down the control channel, because this is the one call that repeats
+// on its own schedule. Going through kitoftor-tunnel.exe meant a process every
+// sixty seconds — and a console process, so Windows created a conhost.exe for
+// it and painted a window. That window is what the desktop "blink" was:
+// briefly, something is on screen, everything behind it repaints, and the
+// cursor flips to busy. windowsHide didn't stop it. No process, no window.
+async function tunnelBypassStdin(listText) {
+  let reply;
+  try {
+    reply = await tunnelPipeCommand('BYPASS', listText || '', 20000);
+  } catch (e) {
+    // Couldn't reach the service at all — that, and only that, is worth
+    // falling back for.
+    logPipeFailure(e);
+    return tunnelBypassViaExe(listText);
+  }
+  // It answered and said no. Running the exe would relay the same refusal
+  // through a second process, so this goes straight back to the caller.
+  if (!reply.startsWith('OK')) throw new Error(reply || 'bypass failed');
+  return reply;
+}
+
+// The original path, kept for when the channel isn't there — most often right
+// after install, before the service has been created and started for the first
+// time.
+function tunnelBypassViaExe(listText) {
   return new Promise((resolve, reject) => {
-    const child = spawn(TUNNEL_EXE, ['start-stdin'], { timeout: 40000 });
+    const child = spawn(TUNNEL_EXE, ['bypass'], { timeout: 20000, windowsHide: true });
+    let out = '', err = '';
+    child.stdout.on('data', (d) => out += d);
+    child.stderr.on('data', (d) => err += d);
+    child.on('close', (code) => {
+      if (code === 0 && out.trim().startsWith('OK')) resolve(out.trim());
+      else reject(new Error(err || out || 'bypass failed'));
+    });
+    child.on('error', (e) => reject(e));
+    child.stdin.write(listText || '');
+    child.stdin.end();
+  });
+}
+
+// Connect goes through the channel too. It isn't on a timer, so it wasn't
+// part of the blinking, but there is no reason to pay for a process here
+// either — and the fallback below is what covers the one case the channel
+// can't: a service that doesn't exist yet. Running the exe is what creates
+// and starts it (ensureServiceRunning in main.go), so that path has to stay.
+async function tunnelStartStdin(configContent) {
+  let reply;
+  try {
+    reply = await tunnelPipeCommand('CONNECT', configContent, 40000);
+  } catch (e) {
+    logPipeFailure(e);
+    return tunnelStartViaExe(configContent);
+  }
+  if (!reply.startsWith('OK')) throw new Error(reply || 'start-stdin failed');
+  return 'OK';
+}
+
+function tunnelStartViaExe(configContent) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(TUNNEL_EXE, ['start-stdin'], { timeout: 40000, windowsHide: true });
     let out = '', err = '';
     child.stdout.on('data', (d) => out += d);
     child.stderr.on('data', (d) => err += d);
@@ -1856,6 +2301,7 @@ function tunnelStartStdin(configContent) {
       if (code === 0 && out.trim() === 'OK') resolve('OK');
       else reject(new Error(err || out || 'start-stdin failed'));
     });
+    child.on('error', (e) => reject(e));
     child.stdin.write(configContent);
     child.stdin.end();
   });
@@ -1866,24 +2312,50 @@ function tunnelStartStdin(configContent) {
 // the tunnel back up with the *new* config instead of leaving the old one
 // running under the old one).
 async function connectVpn() {
-  let conf = await loadConfig();
+  const conf = await loadConfig();
   if (!conf) throw new Error('Конфигурация повреждена или не найдена. Загрузите .conf файл заново.');
 
-  // Apply whitelist (split tunneling) if enabled.
-  const settings = loadSettings();
-  if (Array.isArray(settings.whitelist) && settings.whitelist.length > 0) {
-    try {
-      conf = await applyWhitelistToConfig(conf, settings.whitelist);
-    } catch(e) {
-      console.error('whitelist apply error:', e);
-    }
-  }
-
   updateTrayIcon('connecting');
+  statusMissStreak = 0; // fresh connection: forget any earlier missed polls
+  // The config goes to the tunnel exactly as issued — the whitelist is no
+  // longer baked into it. That is what makes this call fast regardless of how
+  // many sites are whitelisted: the tunnel installs two routes, not several
+  // hundred.
   const result = await tunnelStartStdin(conf);
   saveConnectTime();
   updateTrayIcon('on');
+  // Split tunneling is applied on top of the live tunnel, and kept current
+  // from here on by the refresh loop.
+  startBypassRefresh();
   return result;
+}
+
+// Everything that takes the tunnel down goes through here, so the refresh
+// loop can't outlive the connection it belongs to.
+async function disconnectVpn() {
+  stopBypassRefresh();
+  statusMissStreak = 0;
+  const result = await tunnelStop();
+  deleteConnectTime();
+  updateTrayIcon('off');
+  return result;
+}
+
+// Same shape as the two above: channel first, exe only if the channel isn't
+// there. Note this is DISCONNECT (tear down the tunnel), not service-stop
+// (shut the background service down entirely) — the latter has to keep going
+// through the exe, since it talks to the Service Control Manager rather than
+// to the service's own control channel.
+async function tunnelStop() {
+  let reply;
+  try {
+    reply = await tunnelPipeCommand('DISCONNECT', '', 20000);
+  } catch (e) {
+    logPipeFailure(e);
+    return tunnelExec('stop');
+  }
+  if (!reply.startsWith('OK')) throw new Error(reply || 'stop failed');
+  return reply;
 }
 
 // Settings/whitelist windows can change config/VPN state behind the main
@@ -1902,59 +2374,89 @@ function notifyConfigChanged(payload) {
 ipcMain.handle('vpn:connect', async () => {
   try {
     const result = await connectVpn();
+    showNotification('KitoFtorVPN', 'VPN подключён');
     return { ok: true, result };
   } catch(e) {
     updateTrayIcon('off');
-    return { error: friendlyTunnelError(e.message) };
+    const msg = friendlyTunnelError(e.message);
+    showNotification('KitoFtorVPN', msg);
+    return { error: msg };
   }
 });
 
 ipcMain.handle('vpn:disconnect', async () => {
   try {
-    const result = await tunnelExec('stop');
-    deleteConnectTime();
-    updateTrayIcon('off');
+    const result = await disconnectVpn();
+    showNotification('KitoFtorVPN', 'VPN отключён');
     return { ok: true, result };
   } catch(e) {
+    // The tunnel is considered down either way: leaving the UI showing
+    // "Подключено" after a failed stop is worse than being optimistic here,
+    // since the status poll will correct it within seconds if it's wrong.
+    stopBypassRefresh();
+    deleteConnectTime();
+    updateTrayIcon('off');
     return { error: friendlyTunnelError(e.message) };
   }
 });
 
+// A single unanswered status poll is not proof the tunnel died.
+//
+// It was treated as proof, and that produced a "VPN отключён" notification and
+// a red tray icon while the tunnel was up and working — then green again three
+// seconds later when the next poll got through. The service side no longer
+// stalls status behind other work, which removes the cause; this counter is
+// the belt to that pair of braces. Two consecutive misses are required before
+// a running tunnel is declared down, so any future hiccup costs three extra
+// seconds of stale state instead of a false alarm.
+
 ipcMain.handle('vpn:status', async () => {
+  let full;
   try {
-    const full = await tunnelStatusFull();
-    const state = full.state === 'RUNNING' ? 'on' : 'off';
-    if (state === 'off') {
-      deleteConnectTime();
-    } else {
-      // Resync against the service's own connectStart on every poll
-      // (every 3s from the renderer) instead of trusting whatever's
-      // sitting in connect_time.dat. This is what makes the timer
-      // self-correct even if a previous shutdown didn't get a chance to
-      // clear the file: the service is ground truth, the file is just a
-      // local cache of it for the renderer to read without a service
-      // round-trip on every tick.
-      if (full.connectStartMs) {
-        const cached = loadConnectTime();
-        if (cached !== full.connectStartMs) saveConnectTime(full.connectStartMs);
-      }
-    }
-    if (state !== vpnStateForTray) {
-      // Unexpected drop — was running, now stopped
-      if (vpnStateForTray === 'on' && state === 'off') {
-        showNotification('KitoFtorVPN', 'VPN отключён', true);
-      }
-      updateTrayIcon(state);
-    }
-    return { status: full.state };
+    full = await tunnelStatusFull();
   } catch(e) {
-    deleteConnectTime();
-    if (vpnStateForTray !== 'off') {
-      showNotification('KitoFtorVPN', 'VPN отключён', true);
-      updateTrayIcon('off');
-    }
-    return { status: 'STOPPED' };
+    full = { state: 'STOPPED', connectStartMs: null };
   }
+
+  const reportedOff = full.state !== 'RUNNING';
+
+  if (reportedOff && vpnStateForTray === 'on') {
+    statusMissStreak++;
+    if (statusMissStreak < 2) {
+      // Unconfirmed. Report the last known good state and change nothing —
+      // no notification, no icon change, and crucially no deleteConnectTime(),
+      // which would reset the session timer on a false alarm.
+      return { status: 'RUNNING' };
+    }
+  } else {
+    statusMissStreak = 0;
+  }
+
+  const state = reportedOff ? 'off' : 'on';
+
+  if (state === 'off') {
+    deleteConnectTime();
+  } else if (full.connectStartMs) {
+    // Resync against the service's own connectStart rather than trusting
+    // whatever's in connect_time.dat: the service is ground truth, the file is
+    // a local cache so the renderer can tick without a round-trip each second.
+    const cached = loadConnectTime();
+    if (cached !== full.connectStartMs) saveConnectTime(full.connectStartMs);
+  }
+
+  // A poll landing mid-connect must not touch the tray. It used to: the tunnel
+  // isn't up yet, so the poll saw "off", overwrote the "connecting" icon, and
+  // re-enabled "Подключиться" in the tray menu — from which a second connect
+  // could be started on top of the one already in flight.
+  if (state !== vpnStateForTray && vpnStateForTray !== 'connecting') {
+    if (vpnStateForTray === 'on' && state === 'off') {
+      stopBypassRefresh();
+      showNotification('KitoFtorVPN', 'VPN отключён');
+    }
+    updateTrayIcon(state);
+  }
+
+  return { status: reportedOff ? 'STOPPED' : 'RUNNING' };
 });
 
 ipcMain.handle('vpn:getConnectTime', () => loadConnectTime());
@@ -1963,12 +2465,36 @@ ipcMain.handle('vpn:getConnectTime', () => loadConnectTime());
 
 let subExpiryNotifShown = false; // show once per app session
 
-ipcMain.handle('notify:subExpiring', (event, daysLeft) => {
+// Takes seconds remaining, not days.
+//
+// It used to take days, computed in the renderer as Math.ceil(seconds/86400),
+// and that rounding made the message wrong at exactly the point it matters
+// most. Three hours left became ceil(0.125) = 1 → "заканчивается завтра". And
+// since ceil() of anything positive is at least 1, the "истекает сегодня"
+// branch could never be reached at all. Counting whole days down here fixes
+// both: under a day is today, under two days is tomorrow.
+ipcMain.handle('notify:subExpiring', (event, secondsLeft) => {
   if (subExpiryNotifShown) return;
+  const sec = Number(secondsLeft);
+  if (!Number.isFinite(sec)) return;
   subExpiryNotifShown = true;
-  const msg = daysLeft <= 0 ? 'Подписка истекает сегодня'
-    : daysLeft === 1 ? 'Подписка заканчивается завтра'
-    : `Подписка заканчивается через ${daysLeft} дн.`;
+
+  const days = Math.floor(sec / 86400);
+  let msg;
+  if (sec <= 0) {
+    msg = 'Подписка истекла';
+  } else if (days === 0) {
+    msg = 'Подписка истекает сегодня';
+  } else if (days === 1) {
+    msg = 'Подписка заканчивается завтра';
+  } else {
+    // 2-4 дня / 5+ дней — the plural has to be picked, not hardcoded.
+    const mod10 = days % 10, mod100 = days % 100;
+    const word = (mod100 >= 11 && mod100 <= 14) ? 'дней'
+      : mod10 >= 2 && mod10 <= 4 ? 'дня'
+      : mod10 === 1 ? 'день' : 'дней';
+    msg = `Подписка заканчивается через ${days} ${word}`;
+  }
   showNotification('KitoFtorVPN', msg);
 });
 

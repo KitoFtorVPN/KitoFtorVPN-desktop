@@ -47,7 +47,10 @@ contextBridge.exposeInMainWorld('api', {
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
   // App info
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
-  notifySubExpiring: (days) => ipcRenderer.invoke('notify:subExpiring', days),
+  notifySubExpiring: (secondsLeft) => ipcRenderer.invoke('notify:subExpiring', secondsLeft),
+  // Lets the main process gate the tray's "Подключиться" on the same
+  // subscription status the window is showing.
+  reportSubStatus: (status) => ipcRenderer.invoke('sub:report', status),
 
   // Updater
   updateDownload: () => ipcRenderer.invoke('update:download'),

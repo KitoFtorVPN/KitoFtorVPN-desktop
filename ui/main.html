@@ -317,7 +317,11 @@
         vpnState = p && p.ok ? 'on' : 'off';
         render();
         startSessionTimer();
+        // `notice` is a deliberate refusal (no config, subscription inactive,
+        // couldn't reach the server); `error` is a connection that was tried
+        // and failed. Both belong on screen, not only in the notification.
         if (p && p.error) showError(p.error);
+        else if (p && p.notice) showError(p.notice);
       });
     }
     // Config changed/deleted from the settings window — refresh right away
@@ -333,6 +337,15 @@
     }
 
     let isGuestMode = false;
+
+    // The main process gates autoconnect and the tray menu on the subscription
+    // too, but it has no reason to poll the API separately — the window is
+    // already doing that, so it just forwards each answer.
+    function reportSub(sub) {
+      if (api.reportSubStatus && sub && typeof sub.status === 'string') {
+        api.reportSubStatus(sub.status);
+      }
+    }
 
     async function init() {
       isGuestMode = await api.isGuest();
@@ -353,10 +366,12 @@
           return;
         }
         subData = sub;
-        // Notify if subscription expires within 3 days
+        reportSub(sub);
+        // Notify if subscription expires within 3 days. Seconds go across as
+        // seconds — rounding them to days here is what used to turn "3 hours
+        // left" into "заканчивается завтра".
         if (sub.expires_in !== undefined && sub.expires_in !== null && sub.expires_in <= 259200) {
-          const daysLeft = Math.ceil(sub.expires_in / 86400);
-          api.notifySubExpiring(daysLeft);
+          api.notifySubExpiring(sub.expires_in);
         }
       }
 
@@ -375,6 +390,7 @@
           const fresh = await api.fetch('/api/sub');
           if (!fresh.error) {
             subData = fresh;
+            reportSub(fresh);
             render();
             startSessionTimer();
           }
@@ -481,7 +497,13 @@
         return;
       }
 
-      if (!canConnect) {
+      // No active subscription. The connect button is disabled — but only for
+      // connecting. Disabling it outright was a trap: if the tunnel was
+      // already up (it survived the subscription expiring, or autoconnect
+      // brought it up before the check existed), the user was left looking at
+      // a connected VPN carrying no traffic, with the only way to switch it
+      // off buried in the tray menu.
+      if (!canConnect && vpnState !== 'on' && vpnState !== 'connecting') {
         btn.className = 'power-btn off';
         btn.disabled = true;
         btn.style.display = '';
@@ -656,6 +678,13 @@
         startSessionTimer();
         if (res.error) showError(res.error);
       } else {
+        // Guard the connect direction only — disconnect above is always
+        // allowed, whatever the subscription says.
+        if (!subData || (subData.status !== 'active' && !isGuestMode)) {
+          showError('Подписка неактивна. Продлите подписку, чтобы подключиться.');
+          return;
+        }
+        clearError();
         vpnState = 'connecting'; render();
         const res = await api.connect();
         vpnState = res.ok ? 'on' : 'off';
@@ -665,9 +694,23 @@
       }
     }
 
+    let errorTimer = null;
+
     function showError(text) {
       const el = document.getElementById('error');
-      if (el) { el.textContent = text; el.style.display = 'block'; }
+      if (!el) return;
+      el.textContent = text;
+      el.style.display = 'block';
+      // Messages used to stay on screen for the rest of the session, so a
+      // one-off failure kept accusing the app long after it had connected.
+      if (errorTimer) clearTimeout(errorTimer);
+      errorTimer = setTimeout(clearError, 12000);
+    }
+
+    function clearError() {
+      if (errorTimer) { clearTimeout(errorTimer); errorTimer = null; }
+      const el = document.getElementById('error');
+      if (el) { el.textContent = ''; el.style.display = 'none'; }
     }
 
     function toggleMenu(e) {
