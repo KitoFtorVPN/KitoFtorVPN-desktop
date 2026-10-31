@@ -434,12 +434,32 @@ func parseWgQuickReaderToUAPI(reader io.Reader) (*parsedConfig, error) {
 					}
 				}
 			case "endpoint":
-				uapiLines = append(uapiLines, "endpoint="+val)
+				// val may be a domain name (e.g. "vpn.example.com:51820") rather
+				// than an IP. The WireGuard/AmneziaWG device IPC layer only
+				// accepts a numeric endpoint and will not resolve DNS itself, so
+				// we resolve it here, the same way the official WireGuard apps
+				// do, and hand the device a plain IP:port.
 				host := val
+				port := ""
 				if idx := strings.LastIndex(host, ":"); idx >= 0 {
+					port = host[idx:]
 					host = host[:idx]
 				}
-				pc.endpointHost = host
+				resolvedHost := host
+				if net.ParseIP(host) == nil {
+					// Not a literal IP -- it is a hostname, so look it up. On
+					// failure we fall back to the original (unresolved) value;
+					// the connection will then fail the same way it did before
+					// this change, with the DNS error visible in debug.log.
+					if ips, lerr := net.LookupHost(host); lerr == nil && len(ips) > 0 {
+						resolvedHost = ips[0]
+						log.Printf("parseConfig: resolved endpoint host %q -> %s", host, resolvedHost)
+					} else {
+						log.Printf("parseConfig: failed to resolve endpoint host %q: %v", host, lerr)
+					}
+				}
+				uapiLines = append(uapiLines, "endpoint="+resolvedHost+port)
+				pc.endpointHost = resolvedHost
 			case "persistentkeepalive":
 				uapiLines = append(uapiLines, "persistent_keepalive_interval="+val)
 			}
