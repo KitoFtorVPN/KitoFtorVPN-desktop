@@ -1,21 +1,6 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('api', {
-  // Auth
-  login: () => ipcRenderer.invoke('auth:login'),
-  register: () => ipcRenderer.invoke('auth:register'),
-  google: () => ipcRenderer.invoke('auth:google'),
-  telegram: () => ipcRenderer.invoke('auth:telegram'),
-  logout: () => ipcRenderer.invoke('auth:logout'),
-  sessionExpired: () => ipcRenderer.invoke('auth:sessionExpired'),
-  guestLogin: () => ipcRenderer.invoke('auth:guestLogin'),
-  exitGuest: () => ipcRenderer.invoke('auth:exitGuest'),
-  isGuest: () => ipcRenderer.invoke('auth:isGuest'),
-  getToken: () => ipcRenderer.invoke('auth:getToken'),
-
-  // API (subscription status)
-  fetch: (endpoint) => ipcRenderer.invoke('api:fetch', endpoint),
-
   // Config
   importConfig: () => ipcRenderer.invoke('config:import'),
   configExists: () => ipcRenderer.invoke('config:exists'),
@@ -47,10 +32,6 @@ contextBridge.exposeInMainWorld('api', {
   openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
   // App info
   getVersion: () => ipcRenderer.invoke('app:getVersion'),
-  notifySubExpiring: (secondsLeft) => ipcRenderer.invoke('notify:subExpiring', secondsLeft),
-  // Lets the main process gate the tray's "Подключиться" on the same
-  // subscription status the window is showing.
-  reportSubStatus: (status) => ipcRenderer.invoke('sub:report', status),
 
   // Updater
   updateDownload: () => ipcRenderer.invoke('update:download'),

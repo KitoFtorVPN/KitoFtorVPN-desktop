@@ -278,8 +278,7 @@
   </div>
 
   <script>
-    const SITE_URL = 'https://my.kitoftorvpn.fun';
-    let subData = null;
+    let ready = false;
     let vpnState = 'off';
     let hasConf = false;
     let menuOpen = false;
@@ -317,8 +316,8 @@
         vpnState = p && p.ok ? 'on' : 'off';
         render();
         startSessionTimer();
-        // `notice` is a deliberate refusal (no config, subscription inactive,
-        // couldn't reach the server); `error` is a connection that was tried
+        // `notice` is a deliberate refusal (например, не загружен конфиг);
+        // `error` is a connection that was tried
         // and failed. Both belong on screen, not only in the notification.
         if (p && p.error) showError(p.error);
         else if (p && p.notice) showError(p.notice);
@@ -336,66 +335,16 @@
       });
     }
 
-    let isGuestMode = false;
-
-    // The main process gates autoconnect and the tray menu on the subscription
-    // too, but it has no reason to poll the API separately — the window is
-    // already doing that, so it just forwards each answer.
-    function reportSub(sub) {
-      if (api.reportSubStatus && sub && typeof sub.status === 'string') {
-        api.reportSubStatus(sub.status);
-      }
-    }
-
     async function init() {
-      isGuestMode = await api.isGuest();
-      const token = await api.getToken();
-      if (!token && !isGuestMode) return;
-
-      if (isGuestMode) {
-        // Guest: no subscription, no API calls. Fake "active" sub so UI logic
-        // doesn't block the connect button.
-        subData = { status: 'active', time_left: null, expires_in: null };
-      } else {
-        const sub = await api.fetch('/api/sub');
-        if (sub.error === 'unauthorized' || sub.redirect) {
-          // Session expired on server — go back to login but keep the token
-          // on disk so the user isn't forced to re-enter credentials if the
-          // server was just temporarily unavailable.
-          await api.sessionExpired();
-          return;
-        }
-        subData = sub;
-        reportSub(sub);
-        // Notify if subscription expires within 3 days. Seconds go across as
-        // seconds — rounding them to days here is what used to turn "3 hours
-        // left" into "заканчивается завтра".
-        if (sub.expires_in !== undefined && sub.expires_in !== null && sub.expires_in <= 259200) {
-          api.notifySubExpiring(sub.expires_in);
-        }
-      }
-
       hasConf = await api.configExists();
 
       const vpn = await api.vpnStatus();
       if (vpn.status === 'RUNNING') vpnState = 'on';
 
+      ready = true;
       render();
       startSessionTimer();
       setInterval(pollVPN, 3000);
-
-      // Refresh subscription only for real users.
-      if (!isGuestMode) {
-        setInterval(async () => {
-          const fresh = await api.fetch('/api/sub');
-          if (!fresh.error) {
-            subData = fresh;
-            reportSub(fresh);
-            render();
-            startSessionTimer();
-          }
-        }, 60000);
-      }
     }
 
     let timerInterval = null;
@@ -467,15 +416,15 @@
 
     const powerIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="44" height="44"><path d="M18.36 6.64a9 9 0 11-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>`;
 
-    function updateVpnCenter(s, canConnect) {
+    function updateVpnCenter() {
       const wrap = document.getElementById('vpnCenterWrap');
       const btn = document.getElementById('powerBtn');
       const statusEl = document.getElementById('vpnStatusText');
       const hintEl = document.getElementById('vpnHint');
       if (!wrap || !btn || !statusEl || !hintEl) return;
 
-      // Remove any old dynamic content (import-prompt, btn-renew) injected previously
-      ['importPrompt','btnRenew'].forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
+      // Remove any old dynamic content (import-prompt) injected previously
+      ['importPrompt'].forEach(id => { const el = document.getElementById(id); if (el) el.remove(); });
 
       wrap.style.display = 'flex';
 
@@ -487,38 +436,12 @@
           const div = document.createElement('div');
           div.id = 'importPrompt';
           div.className = 'import-prompt';
-          div.innerHTML = `<p>Для подключения загрузите<br>файл конфигурации (.conf)<br>из личного кабинета или бота</p>
+          div.innerHTML = `<p>Для подключения загрузите<br>файл конфигурации (.conf),<br>который выдал администратор</p>
             <button class="import-link" onclick="doImport()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
               Загрузить конфигурацию
             </button>`;
           wrap.insertBefore(div, wrap.firstChild);
-        }
-        return;
-      }
-
-      // No active subscription. The connect button is disabled — but only for
-      // connecting. Disabling it outright was a trap: if the tunnel was
-      // already up (it survived the subscription expiring, or autoconnect
-      // brought it up before the check existed), the user was left looking at
-      // a connected VPN carrying no traffic, with the only way to switch it
-      // off buried in the tray menu.
-      if (!canConnect && vpnState !== 'on' && vpnState !== 'connecting') {
-        btn.className = 'power-btn off';
-        btn.disabled = true;
-        btn.style.display = '';
-        statusEl.style.display = '';
-        statusEl.className = 'vpn-status off';
-        statusEl.textContent = 'Не подключено';
-        hintEl.style.display = 'none';
-        if (!document.getElementById('btnRenew')) {
-          const btnLabel = s.status === 'none' ? 'Оформить подписку' : 'Продлить подписку';
-          const b = document.createElement('button');
-          b.id = 'btnRenew';
-          b.className = 'btn-renew';
-          b.onclick = () => api.openExternal(SITE_URL + '/login?desktop=1');
-          b.textContent = btnLabel;
-          wrap.appendChild(b);
         }
         return;
       }
@@ -543,7 +466,7 @@
     function render() {
       const app = document.getElementById('app');
       const wrap = document.getElementById('vpnCenterWrap');
-      if (!subData) {
+      if (!ready) {
         app.innerHTML = '<div class="loading">Загрузка...</div>';
         if (wrap) wrap.style.display = 'none';
         return;
@@ -552,64 +475,8 @@
 
       document.body.className = vpnState === 'on' ? 'state-on' : vpnState === 'connecting' ? 'state-connecting' : '';
 
-      const s = subData;
-      let statusClass = 'val-none', statusText = 'Нет подписки';
-      let canConnect = false;
-
-      if (s.status === 'active') {
-        statusClass = 'val-active';
-        statusText = 'Активна';
-        canConnect = true;
-      } else if (s.status === 'expired') {
-        statusClass = 'val-expired';
-        statusText = 'Истекла';
-      } else if (s.status === 'test_ended') {
-        statusClass = 'val-expired';
-        statusText = 'Тест завершён';
-      }
-
-      // Status card
-      const THREE_DAYS = 259200;
-      const isExpiring = s.expires_in && s.expires_in <= THREE_DAYS;
-      const timeClass = isExpiring ? 'val-expired' : 'val-neutral';
-
-      let cardHTML = '';
-      if (isGuestMode) {
-        cardHTML = `
-          <div class="status-card">
-            <div class="status-row">
-              <span class="status-label">Режим</span>
-              <span class="status-value val-neutral">Гостевой</span>
-            </div>
-          </div>`;
-      } else {
-        cardHTML = `
-          <div class="status-card">
-            <div class="status-row">
-              <span class="status-label">Подписка</span>
-              <span class="status-value ${statusClass}">${statusText}</span>
-            </div>`;
-        if (s.time_left) {
-          cardHTML += `
-            <div class="status-row">
-              <span class="status-label">Осталось</span>
-              <span class="status-value ${timeClass}">${s.time_left}</span>
-            </div>`;
-        }
-        cardHTML += '</div>';
-
-        // Renewal warning banner (< 3 days)
-        if (isExpiring && s.status === 'active') {
-          cardHTML += `
-            <div class="renewal-banner">
-              <span class="renewal-banner-text">Подписка заканчивается</span>
-              <button class="renewal-banner-link" onclick="api.openExternal('${SITE_URL}/login?desktop=1')">Продлить</button>
-            </div>`;
-        }
-      }
-
       // VPN center — update static DOM elements, never recreate them (prevents jumping).
-      updateVpnCenter(s, canConnect);
+      updateVpnCenter();
 
       // Menu items
       let menuItems = '';
@@ -622,28 +489,6 @@
           </svg>
           Настройки
         </button>`;
-      if (isGuestMode) {
-        menuItems += `
-          <button class="menu-item" onclick="doExitGuest()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/>
-              <polyline points="10 17 15 12 10 7"/>
-              <line x1="15" y1="12" x2="3" y2="12"/>
-            </svg>
-            Войти в аккаунт
-          </button>`;
-      } else {
-        menuItems += `
-          <button class="menu-item danger" onclick="doLogout()">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/>
-              <polyline points="16 17 21 12 16 7"/>
-              <line x1="21" y1="12" x2="9" y2="12"/>
-            </svg>
-            Выйти из аккаунта
-          </button>`;
-      }
-
       app.innerHTML = `
         <div class="top-bar">
           <span class="app-name">KitoFtorVPN</span>
@@ -661,9 +506,6 @@
           </div>
         </div>
 
-        ${cardHTML}
-
-
       `;
     }
 
@@ -678,12 +520,6 @@
         startSessionTimer();
         if (res.error) showError(res.error);
       } else {
-        // Guard the connect direction only — disconnect above is always
-        // allowed, whatever the subscription says.
-        if (!subData || (subData.status !== 'active' && !isGuestMode)) {
-          showError('Подписка неактивна. Продлите подписку, чтобы подключиться.');
-          return;
-        }
         clearError();
         vpnState = 'connecting'; render();
         const res = await api.connect();
@@ -738,14 +574,6 @@
         render();
         showToast();
       }
-    }
-
-    async function doLogout() {
-      await api.logout();
-    }
-
-    async function doExitGuest() {
-      await api.exitGuest();
     }
 
     async function doOpenSettings() {

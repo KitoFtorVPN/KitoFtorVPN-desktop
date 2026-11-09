@@ -234,7 +234,7 @@
     <div class="setting-row" style="cursor:pointer" onclick="api.openWhitelist()">
       <div class="setting-info">
         <div class="setting-label">Сайты в обход VPN</div>
-        <div class="setting-desc">Указанные сайты будут открываться напрямую</div>
+        <div class="setting-desc">Указанные сайты будут открываться напрямую, без VPN</div>
       </div>
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-dim)">
         <polyline points="9 18 15 12 9 6"/>
@@ -295,7 +295,7 @@
     <div class="confirm-overlay" id="confirmOverlay">
       <div class="confirm-box">
         <div class="confirm-title">Удалить конфигурацию?</div>
-        <div class="confirm-text">VPN отключится, конфигурацию придётся загрузить заново из личного кабинета.</div>
+        <div class="confirm-text">VPN отключится. Чтобы подключиться снова, нужно будет загрузить файл конфигурации заново (его выдаёт администратор).</div>
         <div class="confirm-btns">
           <button class="confirm-cancel" onclick="closeConfirm()">Отмена</button>
           <button class="confirm-ok" onclick="doDeleteConfig()">Удалить</button>

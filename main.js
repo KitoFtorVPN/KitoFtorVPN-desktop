@@ -80,7 +80,6 @@ async function migrateFromKeytar(account, file) {
   }
 }
 
-const API_BASE = 'https://my.kitoftorvpn.fun';
 const TUNNEL_EXE = app.isPackaged
   ? path.join(process.resourcesPath, 'bin', 'kitoftor-tunnel.exe')
   : path.join(__dirname, 'bin', 'kitoftor-tunnel.exe');
@@ -187,13 +186,9 @@ let mainWindow = null;
 let settingsWindow = null;
 let whitelistWindow = null;
 let tray = null;
-let authServer = null;
-let authPort = 0;
-let cachedToken = null;
-let isGuest = false;
 let isQuitting = false;
-// Set when the user lands back on the login screen (logout, guest exit, or a
-// session the server rejected) so a queued autoconnect doesn't fire behind it.
+// Set when a queued autoconnect must not fire (например, пользователь уже сам
+// подключился или отключился).
 let autoconnectCancelled = false;
 
 // ─── Settings ────────────────────────────────────────────
@@ -731,52 +726,6 @@ function dpapiDecrypt(base64data) {
   });
 }
 
-// ─── Token storage (DPAPI) ───────────────────────────────
-
-async function saveToken(token) {
-  try {
-    secretWrite(TOKEN_FILE, token);
-  } catch(e) {
-    console.error('saveToken error:', e);
-  }
-}
-
-async function loadToken() {
-  try {
-    // Current format.
-    const val = secretRead(TOKEN_FILE);
-    if (val) return val;
-
-    // Legacy 1: keytar / Credential Manager.
-    const migrated = await migrateFromKeytar(KEYTAR_TOKEN_ACCOUNT, TOKEN_FILE);
-    if (migrated) return migrated;
-
-    // Legacy 2: DPAPI blob written by the tunnel helper. Re-encrypt with
-    // safeStorage so this path is only ever taken once.
-    if (fs.existsSync(TOKEN_FILE)) {
-      const encrypted = fs.readFileSync(TOKEN_FILE, 'utf-8').trim();
-      if (encrypted) {
-        const plain = await dpapiDecrypt(encrypted).catch(() => null);
-        if (plain) {
-          try { secretWrite(TOKEN_FILE, plain); } catch(e) {}
-          return plain;
-        }
-      }
-    }
-    return null;
-  } catch(e) {
-    console.error('loadToken error:', e);
-    return null;
-  }
-}
-
-function deleteToken() {
-  if (keytar) {
-    keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT).catch(() => {});
-  }
-  secretDelete(TOKEN_FILE);
-}
-
 // ─── Config storage (DPAPI) ──────────────────────────────
 
 async function saveConfig(confText) {
@@ -952,31 +901,20 @@ async function quitApp() {
 
 // ─── Window ──────────────────────────────────────────────
 
-const LOGIN_SIZE = { width: 310, height: 520 };
 const MAIN_SIZE = { width: 310, height: 500 };
-
-function resizeWindowFor(page) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  const size = page === 'login' ? LOGIN_SIZE : MAIN_SIZE;
-  const bounds = mainWindow.getBounds();
-  const centerX = bounds.x + Math.round(bounds.width / 2);
-  const centerY = bounds.y + Math.round(bounds.height / 2);
-  mainWindow.setBounds({
-    x: centerX - Math.round(size.width / 2),
-    y: centerY - Math.round(size.height / 2),
-    width: size.width,
-    height: size.height,
-  }, true);
-}
 
 async function createWindow() {
   const startHidden = process.argv.includes('--hidden');
 
-  // Pre-decide which page so we can size the window correctly from the start.
-  cachedToken = await loadToken();
-  isGuest = !cachedToken && loadGuestMode();
-  const startsOnMain = !!cachedToken || isGuest;
-  const size = startsOnMain ? MAIN_SIZE : LOGIN_SIZE;
+  // Старые данные входа в аккаунт больше не нужны — убираем, если остались
+  // от прошлых версий.
+  secretDelete(TOKEN_FILE);
+  try { fs.unlinkSync(GUEST_FILE); } catch(e) {}
+  if (keytar) {
+    keytar.deletePassword(KEYTAR_SERVICE, KEYTAR_TOKEN_ACCOUNT).catch(() => {});
+  }
+
+  const size = MAIN_SIZE;
 
   mainWindow = new BrowserWindow({
     width: size.width,
@@ -1012,17 +950,13 @@ async function createWindow() {
   updateTrayMenu();
 
   // Load page
-  if (startsOnMain) {
-    mainWindow.loadFile('ui/main.html');
-  } else {
-    mainWindow.loadFile('ui/login.html');
-  }
+  mainWindow.loadFile('ui/main.html');
 
   const settings = loadSettings();
 
   // Auto-connect. Everything that decides whether that is allowed lives in
   // runAutoconnect() — see the note there.
-  if (settings.autoconnect && (cachedToken || isGuest)) {
+  if (settings.autoconnect) {
     // Tell the renderer we intend to connect as soon as it can show it, so
     // the window doesn't sit on "Не подключено" while we check.
     mainWindow.webContents.once('did-finish-load', () => {
@@ -1034,92 +968,16 @@ async function createWindow() {
   }
 }
 
-// ─── Subscription gate ───────────────────────────────────
+// ─── Условие подключения ─────────────────────────────────
 //
-// The main window has always known whether the subscription is active — it
-// fetches /api/sub to draw the status card. The main process didn't, which is
-// why two things could connect regardless of it: autoconnect at startup, and
-// the tray's "Подключиться". Both are here now, and both consult the same
-// answer the window shows.
-//
-// 'unknown' is a distinct outcome from 'expired' on purpose: it means the
-// server couldn't be reached, not that the subscription is bad.
-let subStatus = 'unknown'; // 'active' | 'expired' | 'none' | 'test_ended' | 'unknown'
-
-// The window reports every /api/sub result it gets, so the tray stays correct
-// as the subscription changes during a session (including expiring while the
-// app is open).
-ipcMain.handle('sub:report', (event, status) => {
-  if (typeof status === 'string' && status) subStatus = status;
-  updateTrayMenu();
-  return { ok: true };
-});
-
-// A guest has no account and therefore no subscription to check — that's the
-// whole point of guest mode, and it's how a manually issued config is used.
+// Подключиться можно, когда загружен файл конфигурации.
 function canConnectNow() {
-  if (!hasConfig()) return false;
-  if (isGuest) return true;
-  return subStatus === 'active';
+  return hasConfig();
 }
 
-// Raw GET against the API with the session cookie. Same request the renderer
-// makes through api:fetch, available to the main process.
-function apiGet(endpoint) {
-  return new Promise((resolve) => {
-    if (!cachedToken) return resolve({ error: 'no_token' });
-    const url = buildApiUrl(endpoint);
-    if (!url) return resolve({ error: 'bad_endpoint' });
-    const req = https.get(url, { headers: { 'Cookie': `cabinet_session=${cachedToken}` } }, (res) => {
-      let data = '';
-      res.on('data', (c) => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { resolve({ error: res.statusCode === 401 ? 'unauthorized' : 'parse_error' }); }
-      });
-    });
-    req.on('error', (e) => resolve({ error: e.message }));
-    req.setTimeout(10000, () => { req.destroy(); resolve({ error: 'timeout' }); });
-  });
-}
-
-// Checks the subscription, retrying a few times on network failure.
-//
-// The retries are not optional politeness: with autostart the app is running
-// seconds after logon, when the adapter may still be coming up and DNS isn't
-// answering yet. A single failed request there would look identical to "the
-// server says no", and the user would be told their subscription couldn't be
-// verified every single boot.
-async function fetchSubStatus(attempts = 3) {
-  for (let i = 0; i < attempts; i++) {
-    const sub = await apiGet('/api/sub');
-    if (sub && !sub.error && typeof sub.status === 'string') {
-      subStatus = sub.status;
-      return sub;
-    }
-    if (sub && sub.error === 'unauthorized') {
-      subStatus = 'unknown';
-      return sub;
-    }
-    if (i < attempts - 1) await new Promise(r => setTimeout(r, 4000));
-  }
-  subStatus = 'unknown';
-  return { error: 'unreachable' };
-}
-
-// Autoconnect, with the three refusals that were missing.
-//
-// Previously this checked only that a token or guest flag existed, then
-// connected. So it would happily bring the tunnel up with no config (the
-// window sat on "Подключение..." until it gave up), or with an expired
-// subscription — where the tunnel comes up against a peer the server has
-// already removed, producing a connection that carries no traffic. The window
-// meanwhile disabled its own power button because the subscription was
-// expired, leaving no way to switch off the thing that had just broken the
-// user's internet except the tray menu.
-//
-// Autostart itself is unaffected by all of this: the app still launches, it
-// just doesn't connect, and says why.
+// Автоподключение при запуске. Не подключается, если не загружен файл
+// конфигурации; уже работающий туннель (например, после быстрого запуска
+// Windows) подхватывается, а не пересоздаётся.
 async function runAutoconnect() {
   if (autoconnectCancelled) return;
   const notifyAndStop = (message) => {
@@ -1146,19 +1004,6 @@ async function runAutoconnect() {
 
     if (!hasConfig()) {
       return notifyAndStop('Автоподключение отменено: не загружен файл конфигурации');
-    }
-
-    if (!isGuest) {
-      const sub = await fetchSubStatus();
-      if (sub.error === 'unauthorized') {
-        return notifyAndStop('Автоподключение отменено: требуется вход в аккаунт');
-      }
-      if (sub.error) {
-        return notifyAndStop('Автоподключение отменено: не удалось проверить подписку');
-      }
-      if (sub.status !== 'active') {
-        return notifyAndStop('Автоподключение отменено: подписка неактивна');
-      }
     }
 
     updateTrayIcon('connecting');
@@ -1553,262 +1398,9 @@ function openWhitelist() {
   });
 }
 
-// ─── Auth: browser + local callback ─────────────────────
-
-function findFreePort() {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.listen(0, () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-// The callback server used to accept /callback?token=... from anyone who
-// could reach the port. A cross-origin GET from any web page the user has
-// open needs no preflight, so a malicious site could scan localhost ports
-// and plant *its* session token in the app — after which the user is
-// silently working under the attacker's account and config.
-//
-// Three things close that: a random state that the site cannot know,
-// generated here and echoed back by our own backend; a Sec-Fetch-Site
-// check, which browsers set on cross-site requests and cannot be forged by
-// page script; and a lifetime cap, so the server isn't left listening
-// forever when a login is abandoned halfway.
-let authState = null;
-let authTimer = null;
-
-function closeAuthServer() {
-  if (authTimer) { clearTimeout(authTimer); authTimer = null; }
-  if (authServer) { authServer.close(); authServer = null; }
-  authState = null;
-}
-
-async function startAuthServer() {
-  if (authServer) return authPort;
-  authPort = await findFreePort();
-  authState = crypto.randomBytes(32).toString('hex');
-
-  if (authTimer) clearTimeout(authTimer);
-  authTimer = setTimeout(() => { closeAuthServer(); }, 5 * 60 * 1000);
-
-  return new Promise((resolve) => {
-    authServer = http.createServer(async (req, res) => {
-      const url = new URL(req.url, `http://localhost:${authPort}`);
-      if (url.pathname === '/callback') {
-        // Browsers set these themselves and page script cannot forge them.
-        //
-        // Checking Sec-Fetch-Site for "not cross-site" was wrong: the real
-        // login is a redirect from my.kitoftorvpn.fun to localhost, which IS
-        // cross-site, so the legitimate flow got a 403.
-        //
-        // What actually separates a login from an attack is the *kind* of
-        // request. A real callback is a top-level navigation — the browser
-        // going to an address. An attack from another site would be a
-        // background fetch/XHR/image load, which carries mode=cors|no-cors
-        // and dest=empty|image, never navigate/document.
-        //
-        // The primary defence remains the state parameter below; this check
-        // just removes the easiest class of attempt.
-        const mode = req.headers['sec-fetch-mode'];
-        const dest = req.headers['sec-fetch-dest'];
-        if ((mode && mode !== 'navigate') || (dest && dest !== 'document')) {
-          console.error('auth callback: rejected non-navigation request', mode, dest);
-          res.writeHead(403);
-          res.end('Forbidden');
-          return;
-        }
-        const token = url.searchParams.get('token');
-        const state = url.searchParams.get('state');
-        if (!authState || state !== authState) {
-          // Reached either by a forged callback (the point of the check) or
-          // because the backend didn't pass ?state= through to the redirect.
-          // The message names the second case explicitly: it is the one a
-          // real user can hit, and "Invalid state" alone would send them
-          // hunting in the wrong place.
-          console.error('auth callback: state mismatch (backend must echo the state parameter back)');
-          res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(`
-            <html><body style="background:#0b1120;color:#f1f5f9;font-family:-apple-system,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-              <div style="text-align:center;max-width:420px">
-                <h2 style="color:#ef4444;font-size:20px;margin-bottom:8px">Не удалось завершить вход</h2>
-                <p style="color:#94a3b8;font-size:14px">Запрос не прошёл проверку безопасности. Закройте эту вкладку и попробуйте войти заново.</p>
-              </div>
-            </body></html>
-          `);
-          return;
-        }
-        if (token) {
-          cachedToken = token;
-          await saveToken(token);
-          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-          res.end(`
-            <html><body style="background:#0b1120;color:#f1f5f9;font-family:-apple-system,'Segoe UI',sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0">
-              <div style="text-align:center">
-                <div style="font-size:40px;margin-bottom:12px">&#10003;</div>
-                <h2 style="color:#10b981;font-size:20px;margin-bottom:8px">Авторизация успешна</h2>
-                <p style="color:#94a3b8;font-size:14px">Можете закрыть эту вкладку и вернуться в приложение.</p>
-              </div>
-            </body></html>
-          `);
-          if (mainWindow) {
-            resizeWindowFor('main');
-            mainWindow.loadFile('ui/main.html');
-            mainWindow.show();
-            mainWindow.focus();
-          }
-          setTimeout(() => { closeAuthServer(); }, 2000);
-        } else {
-          res.writeHead(400);
-          res.end('Missing token');
-        }
-      } else {
-        res.writeHead(404);
-        res.end('Not found');
-      }
-    });
-    authServer.listen(authPort, '127.0.0.1', () => resolve(authPort));
-  });
-}
-
-// ─── IPC: Auth ───────────────────────────────────────────
+// ─── IPC: App ────────────────────────────────────────────
 
 ipcMain.handle('app:getVersion', () => app.getVersion());
-
-ipcMain.handle('auth:login', async () => {
-  const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/login?desktop=1&port=${port}&state=${authState}`);
-  return { ok: true };
-});
-
-ipcMain.handle('auth:register', async () => {
-  const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/register?desktop=1&port=${port}&state=${authState}`);
-  return { ok: true };
-});
-
-ipcMain.handle('auth:google', async () => {
-  const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/auth/google?desktop=1&port=${port}&state=${authState}`);
-  return { ok: true };
-});
-
-ipcMain.handle('auth:telegram', async () => {
-  const port = await startAuthServer();
-  shell.openExternal(`${API_BASE}/auth/telegram?desktop=1&port=${port}&state=${authState}`);
-  return { ok: true };
-});
-
-ipcMain.handle('auth:logout', async () => {
-  cachedToken = null;
-  isGuest = false;
-  subStatus = 'unknown';
-  autoconnectCancelled = true;
-  deleteToken();
-  deleteGuestMode();
-  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
-  if (mainWindow) {
-    resizeWindowFor('login');
-    mainWindow.loadFile('ui/login.html');
-  }
-  return { ok: true };
-});
-
-// Session expired — show login screen WITHOUT deleting the saved token.
-// The token stays on disk so if the server was temporarily unavailable,
-// the next launch won't force a full re-login.
-ipcMain.handle('auth:sessionExpired', async () => {
-  cachedToken = null;
-  isGuest = false;
-  subStatus = 'unknown';
-  // The pending autoconnect has to be cancelled here, not just left to fail.
-  // It runs on a timer set at startup, and the session check that lands the
-  // user back on the login screen finishes well before that timer fires — so
-  // the tunnel came up two seconds after the app had decided the user wasn't
-  // logged in, leaving a connected VPN behind a login screen.
-  autoconnectCancelled = true;
-  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
-  if (mainWindow) {
-    resizeWindowFor('login');
-    mainWindow.loadFile('ui/login.html');
-  }
-  return { ok: true };
-});
-
-// Guest login — skip auth/subscription, go straight to main window.
-ipcMain.handle('auth:guestLogin', async () => {
-  isGuest = true;
-  cachedToken = null;
-  saveGuestMode();
-  if (mainWindow) {
-    resizeWindowFor('main');
-    mainWindow.loadFile('ui/main.html');
-  }
-  return { ok: true };
-});
-
-// Leave guest mode — back to login screen.
-ipcMain.handle('auth:exitGuest', async () => {
-  isGuest = false;
-  autoconnectCancelled = true;
-  deleteGuestMode();
-  try { await disconnectVpn(); } catch(e) { updateTrayIcon('off'); }
-  if (mainWindow) {
-    resizeWindowFor('login');
-    mainWindow.loadFile('ui/login.html');
-  }
-  return { ok: true };
-});
-
-ipcMain.handle('auth:isGuest', () => isGuest);
-ipcMain.handle('auth:getToken', () => cachedToken || null);
-
-// ─── IPC: API proxy (subscription status) ────────────────
-
-// The session cookie is attached to this request, so `endpoint` must not be
-// able to change which host it goes to. String-concatenating it onto
-// API_BASE used to allow exactly that: an endpoint of "@evil.com/x" produces
-// "https://my.kitoftorvpn.fun@evil.com/x", where everything before the "@"
-// is userinfo and the real host is evil.com — handing the user's session
-// token to whoever asked. Require a plain absolute path, then verify the
-// parsed host really is ours before sending anything.
-function buildApiUrl(endpoint) {
-  if (typeof endpoint !== 'string') return null;
-  if (!endpoint.startsWith('/') || endpoint.startsWith('//')) return null;
-  if (endpoint.includes('@') || endpoint.includes('\\')) return null;
-  let u;
-  try { u = new URL(API_BASE + endpoint); } catch(e) { return null; }
-  if (u.origin !== new URL(API_BASE).origin) return null;
-  return u.toString();
-}
-
-ipcMain.handle('api:fetch', async (event, endpoint) => {
-  if (!cachedToken) return { error: 'no_token' };
-  const url = buildApiUrl(endpoint);
-  if (!url) return { error: 'bad_endpoint' };
-  try {
-    return new Promise((resolve) => {
-      const req = https.get(url, {
-        headers: { 'Cookie': `cabinet_session=${cachedToken}` }
-      }, (res) => {
-        let data = '';
-        res.on('data', (chunk) => data += chunk);
-        res.on('end', () => {
-          try { resolve(JSON.parse(data)); }
-          catch(e) {
-            if (res.statusCode === 401) resolve({ error: 'unauthorized' });
-            else resolve({ error: 'parse_error', raw: data.substring(0, 200) });
-          }
-        });
-      });
-      req.on('error', (e) => resolve({ error: e.message }));
-      req.setTimeout(10000, () => { req.destroy(); resolve({ error: 'timeout' }); });
-    });
-  } catch(e) {
-    return { error: e.message };
-  }
-});
 
 // ─── IPC: Config import ──────────────────────────────────
 
@@ -1823,7 +1415,7 @@ ipcMain.handle('config:import', async () => {
   try {
     const confText = fs.readFileSync(result.filePaths[0], 'utf-8');
     if (!confText.includes('[Interface]') || !confText.includes('[Peer]')) {
-      return { error: 'Неверный формат файла. Нужен .conf файл из личного кабинета.' };
+      return { error: 'Неверный формат файла. Нужен .conf файл, который выдал администратор.' };
     }
 
     // If the tunnel is already up, it was started with the *old* config's
@@ -1983,18 +1575,6 @@ ipcMain.handle('whitelist:save', async (event, list) => {
 });
 
 // ─── Connect time persistence ────────────────────────────
-
-function saveGuestMode() {
-  try { fs.writeFileSync(GUEST_FILE, '1', 'utf-8'); } catch(e) {}
-}
-
-function loadGuestMode() {
-  try { return fs.existsSync(GUEST_FILE); } catch(e) { return false; }
-}
-
-function deleteGuestMode() {
-  try { fs.unlinkSync(GUEST_FILE); } catch(e) {}
-}
 
 function saveConnectTime(timestampMs) {
   try {
@@ -2460,43 +2040,6 @@ ipcMain.handle('vpn:status', async () => {
 });
 
 ipcMain.handle('vpn:getConnectTime', () => loadConnectTime());
-
-// ─── IPC: Subscription expiry notification ───────────────
-
-let subExpiryNotifShown = false; // show once per app session
-
-// Takes seconds remaining, not days.
-//
-// It used to take days, computed in the renderer as Math.ceil(seconds/86400),
-// and that rounding made the message wrong at exactly the point it matters
-// most. Three hours left became ceil(0.125) = 1 → "заканчивается завтра". And
-// since ceil() of anything positive is at least 1, the "истекает сегодня"
-// branch could never be reached at all. Counting whole days down here fixes
-// both: under a day is today, under two days is tomorrow.
-ipcMain.handle('notify:subExpiring', (event, secondsLeft) => {
-  if (subExpiryNotifShown) return;
-  const sec = Number(secondsLeft);
-  if (!Number.isFinite(sec)) return;
-  subExpiryNotifShown = true;
-
-  const days = Math.floor(sec / 86400);
-  let msg;
-  if (sec <= 0) {
-    msg = 'Подписка истекла';
-  } else if (days === 0) {
-    msg = 'Подписка истекает сегодня';
-  } else if (days === 1) {
-    msg = 'Подписка заканчивается завтра';
-  } else {
-    // 2-4 дня / 5+ дней — the plural has to be picked, not hardcoded.
-    const mod10 = days % 10, mod100 = days % 100;
-    const word = (mod100 >= 11 && mod100 <= 14) ? 'дней'
-      : mod10 >= 2 && mod10 <= 4 ? 'дня'
-      : mod10 === 1 ? 'день' : 'дней';
-    msg = `Подписка заканчивается через ${days} ${word}`;
-  }
-  showNotification('KitoFtorVPN', msg);
-});
 
 // ─── IPC: Window controls ────────────────────────────────
 

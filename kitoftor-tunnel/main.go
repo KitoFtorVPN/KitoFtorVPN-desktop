@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -95,6 +96,35 @@ type parsedConfig struct {
 	endpointHost string
 	allowedIPs   []string
 	uapi         string
+	mtu          int // 0 = не задан, берётся значение по умолчанию
+}
+
+// Размер пакета внутри туннеля. Если в конфиге MTU не указан, берём
+// безопасное значение: у адаптера Wintun по умолчанию огромный MTU, из-за
+// чего часть сайтов зависает (слишком большие пакеты не проходят).
+func (pc *parsedConfig) effectiveMTU() int {
+	if pc.mtu > 0 {
+		return pc.mtu
+	}
+	return 1280
+}
+
+// setTunnelMTU задаёт MTU самого сетевого адаптера Windows.
+func setTunnelMTU(luid winipcfg.LUID, mtu int) {
+	if luid != 0 {
+		if ipif, err := luid.IPInterface(windows.AF_INET); err == nil {
+			ipif.NLMTU = uint32(mtu)
+			if serr := ipif.Set(); serr == nil {
+				log.Printf("setTunnelMTU: MTU=%d (winipcfg)", mtu)
+				return
+			} else {
+				log.Printf("setTunnelMTU: winipcfg Set failed: %v", serr)
+			}
+		} else {
+			log.Printf("setTunnelMTU: IPInterface failed: %v", err)
+		}
+	}
+	runNetsh("interface", "ipv4", "set", "subinterface", tunnelInterfaceName, fmt.Sprintf("mtu=%d", mtu), "store=active")
 }
 
 // ─── DPAPI ───────────────────────────────────────────────
@@ -357,6 +387,34 @@ var supportedAWGKeys = map[string]bool{
 	"i1": true, "i2": true, "i3": true, "i4": true, "i5": true,
 }
 
+// Настройки AmneziaWG 3.x: имя в .conf -> имя в UAPI движка.
+var awgKeyAliases = map[string]string{
+	"contentpaddingaddition": "content_padding_addition",
+	"rekeyaftertime":         "rekey_after_time",
+	"rekeytimeout":           "rekey_timeout",
+	"rejectaftertime":        "reject_after_time",
+	"keepalivetimeout":       "keepalive_timeout",
+	"maxhandshakeattempts":   "max_handshake_attempts",
+}
+
+// keyToHex принимает 32-байтовый ключ в base64 (как в .conf) или уже в hex.
+func keyToHex(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if len(s) == 64 {
+		if _, err := hex.DecodeString(s); err == nil {
+			return strings.ToLower(s), nil
+		}
+	}
+	h, err := b64toHex(s)
+	if err != nil {
+		return "", err
+	}
+	if len(h) != 64 {
+		return "", fmt.Errorf("неверная длина ключа")
+	}
+	return h, nil
+}
+
 func parseWgQuickStringToUAPI(confStr string) (*parsedConfig, error) {
 	return parseWgQuickReaderToUAPI(strings.NewReader(confStr))
 }
@@ -408,6 +466,18 @@ func parseWgQuickReaderToUAPI(reader io.Reader) (*parsedConfig, error) {
 					}
 				}
 			case keyLower == "mtu":
+				if n, err := strconv.Atoi(val); err == nil && n >= 576 && n <= 1500 {
+					pc.mtu = n
+				}
+			case keyLower == "headerprotectionkey":
+				h, err := keyToHex(val)
+				if err == nil {
+					uapiLines = append(uapiLines, "header_protection_key="+h)
+				} else {
+					log.Printf("parseConfig: bad HeaderProtectionKey: %v", err)
+				}
+			case awgKeyAliases[keyLower] != "":
+				uapiLines = append(uapiLines, awgKeyAliases[keyLower]+"="+val)
 			case supportedAWGKeys[keyLower]:
 				uapiLines = append(uapiLines, keyLower+"="+val)
 			default:
@@ -713,7 +783,7 @@ func (s *vpnService) Execute(args []string, r <-chan svc.ChangeRequest, changes 
 					gwCh <- info
 				}()
 
-				wintun, err := tun.CreateTUN(tunnelInterfaceName, 0)
+				wintun, err := tun.CreateTUN(tunnelInterfaceName, pc.effectiveMTU())
 				if err != nil {
 					writeReply(res.conn, "ERROR: CreateTUN failed: "+err.Error())
 					res.conn.Close()
@@ -923,6 +993,31 @@ func ensureServiceRunning() error {
 	}
 	defer s.Close()
 
+	// Служба создаётся один раз и запоминает путь к exe. Если приложение
+	// перенесли или обновили в другую папку, служба без этой проверки
+	// продолжала бы запускать СТАРЫЙ exe из прежней папки (со старым движком).
+	wantPath := syscall.EscapeArg(exePath) + " service"
+	if cfg, cerr := s.Config(); cerr == nil {
+		have := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(cfg.BinaryPathName), "\"", ""))
+		want := strings.ToLower(strings.ReplaceAll(wantPath, "\"", ""))
+		if have != want {
+			log.Printf("service binary path changed: %q -> %q", cfg.BinaryPathName, wantPath)
+			if cur, qerr := s.Query(); qerr == nil && cur.State != svc.Stopped {
+				s.Control(svc.Stop)
+				for i := 0; i < 30; i++ {
+					if cur, qerr := s.Query(); qerr == nil && cur.State == svc.Stopped {
+						break
+					}
+					time.Sleep(300 * time.Millisecond)
+				}
+			}
+			cfg.BinaryPathName = wantPath
+			if uerr := s.UpdateConfig(cfg); uerr != nil {
+				log.Printf("service UpdateConfig failed: %v", uerr)
+			}
+		}
+	}
+
 	st, err := s.Query()
 	if err == nil && st.State == svc.Running {
 		return nil // already running, nothing to do
@@ -1031,6 +1126,8 @@ func configureNetwork(pc *parsedConfig, physLUID winipcfg.LUID, physGW netip.Add
 
 	luid := tunnelLUID(wgDev)
 	tunIPAddr, _ := netipAddrFromString(ip.String())
+
+	setTunnelMTU(winipcfg.LUID(luid), pc.effectiveMTU())
 
 	var wg sync.WaitGroup
 

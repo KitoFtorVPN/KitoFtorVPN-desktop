@@ -1,6 +1,6 @@
 # KitoFtorVPN Desktop
 
-Windows-клиент KitoFtorVPN на базе AmneziaWG 2.0.
+Windows-клиент KitoFtorVPN на базе AmneziaWG. Поддерживает конфигурации AmneziaWG 2.0 и 3.1.
 
 ## Возможности
 
@@ -9,13 +9,15 @@ Windows-клиент KitoFtorVPN на базе AmneziaWG 2.0.
 - Защита от утечек IPv6
 - Автозапуск при старте Windows, в том числе свёрнутым в трей
 - Автоподключение при запуске
-- Хранение конфигов и токенов с шифрованием Windows DPAPI
-- Авторизация: email, Google, Telegram, гостевой режим
+- Хранение конфигурации с шифрованием Windows DPAPI
+- Импорт конфигурации из файла `.conf` (его выдаёт администратор)
 - Автообновления через GitHub Releases
 
 ## Установка
 
 Скачай последнюю версию `KitoFtorVPN-Setup.exe` со страницы [Releases](https://github.com/KitoFtorVPN/KitoFtorVPN-desktop/releases) и запусти.
+
+Файл конфигурации (`.conf`) выдаёт администратор. Один конфиг — одно устройство.
 
 Для работы приложения требуются права администратора (необходимы для создания TUN-интерфейса и настройки маршрутов).
 
@@ -26,7 +28,7 @@ Windows-клиент KitoFtorVPN на базе AmneziaWG 2.0.
 ## Стек
 
 - [Electron](https://www.electronjs.org/) — UI (HTML/CSS/JS)
-- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — VPN-движок (Go)
+- [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go) — VPN-движок (Go), версия с поддержкой AmneziaWG 3.1
 - [Wintun](https://www.wintun.net/) — TUN-драйвер
 - [electron-builder](https://www.electron.build/) — сборка установщика
 - [electron-updater](https://github.com/electron-userland/electron-updater) — автообновления
@@ -76,7 +78,6 @@ KitoFtorVPN/
 ├── preload.js        — IPC-мост для renderer-процесса
 ├── package.json      — зависимости и конфиг electron-builder
 ├── ui/               — HTML-страницы интерфейса
-│   ├── login.html
 │   ├── main.html
 │   ├── settings.html
 │   ├── whitelist.html
@@ -91,7 +92,3 @@ KitoFtorVPN/
 │   └── wintun.dll
 └── build/            — иконки приложения, трея и NSIS-скрипт
 ```
-
-## Сайт
-
-[kitoftorvpn.fun](https://kitoftorvpn.fun)
